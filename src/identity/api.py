@@ -7,7 +7,6 @@ from urllib.parse import urlencode
 import psycopg
 from apgkit import __version__ as kit_version  # noqa: F401
 from apgkit import vault as vault_mod
-from apgkit.auth.rp import safe_return_to
 from apgkit.guard import SecurityGuard
 from apgkit.web import is_https, mount_kit_static, public_url
 from authlib.oauth2.rfc6749 import OAuth2Error
@@ -145,7 +144,7 @@ class _Body(BaseModel):
 class LoginBody(_Body):
     username: str = Field(min_length=1, max_length=254)
     password: str = Field(min_length=1, max_length=256)
-    next: str | None = Field(None, max_length=300)
+    next: str | None = Field(None, max_length=2048)
 
 
 @app.get("/login")
@@ -177,7 +176,7 @@ def login(body: LoginBody, request: Request, response: Response):
             start_sso(conn, request, response, user)
     except (psycopg.Error, RuntimeError) as exc:
         raise _unavailable() from exc
-    return {"next": safe_return_to(body.next)}
+    return {"next": core.safe_next(body.next)}
 
 
 @app.get("/login/{provider}")

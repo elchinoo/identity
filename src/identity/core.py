@@ -33,3 +33,14 @@ auth = Authenticator(APP_AUTH, local, db, cookie_name=COOKIE_ADMIN, allow_anonym
 
 def issuer(public_url: str) -> str:
     return (os.environ.get("IDENTITY_ISSUER") or public_url).rstrip("/")
+
+
+MAX_NEXT = 2048
+
+
+def safe_next(value: str | None) -> str:
+    """Where to go after signing in: only a same-site path. Longer than the kit's default, because the authorization URL an app
+    sends the browser to (client id, a long redirect URI, state, nonce, PKCE challenge) easily passes 300 characters."""
+    if value and value.startswith("/") and not value.startswith("//") and "\\" not in value and len(value) <= MAX_NEXT:
+        return value
+    return "/"

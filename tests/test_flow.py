@@ -247,3 +247,13 @@ def test_signing_key_rotation_keeps_old_tokens_valid(idp):
     new = exchange(idp, code, pk2[0], w["secret"]).json()["access_token"]
     assert v.verify(new)["sub"] == w["uid"] and old.split(".")[0] != new.split(".")[0]      # signed with a different key id
     assert time.time() > 0
+
+
+def test_a_long_authorization_url_survives_the_login_round_trip(idp):
+    """AgentPG hostnames are long: the authorize URL an app sends the browser to passes 300 characters, and sign-in must still return to it."""
+    long_next = "/oauth/authorize?" + "x=" + "a" * 900
+    r = idp.post("/login", json={"username": "nobody", "password": "wrong-password", "next": long_next}, headers=CSRF)
+    assert r.status_code == 401                                         # validated, not rejected as too long
+    from identity import core
+    assert core.safe_next(long_next) == long_next and core.safe_next("/" + "a" * 3000) == "/"
+    assert core.safe_next("//evil.example") == "/" and core.safe_next("https://evil.example") == "/" and core.safe_next("/a\\b") == "/"

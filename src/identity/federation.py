@@ -11,11 +11,11 @@ A disabled user is refused whatever the provider says.
 import re
 import secrets
 from collections.abc import Callable
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 from apgkit.auth.oidc import TokenError, _client_factory
-from apgkit.auth.rp import RelyingParty, safe_return_to
+from apgkit.auth.rp import RelyingParty
 from psycopg.types.json import Jsonb  # noqa: F401  (kept for providers that later store raw profiles)
 
 from . import core, users
@@ -100,13 +100,17 @@ def begin(conn, provider: str, base_url: str, next_url: str | None) -> str:
     redirect_uri = _callback(base_url, provider)
     if provider == "google":
         rp = RelyingParty(GOOGLE_ISSUER, cfg["client_id"], lambda: core.vault.decrypt(cfg["client_secret_enc"]), http=http_factory, scopes="openid email profile")
-        return rp.begin(conn, redirect_uri, next_url)
+        url = rp.begin(conn, redirect_uri, next_url)
+        state = parse_qs(urlsplit(url).query)["state"][0]
+        conn.execute("UPDATE oidc_login SET return_to=%s WHERE state=%s", (core.safe_next(next_url), state))   # the kit keeps only 300 characters
+        conn.commit()
+        return url
     state, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(48)
     import base64
     import hashlib
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     conn.execute("DELETE FROM oidc_login WHERE created_at < now() - %s * interval '1 minute'", (STATE_MINUTES,))
-    conn.execute("INSERT INTO oidc_login (state, verifier, nonce, return_to) VALUES (%s,%s,'-',%s)", (state, verifier, safe_return_to(next_url)))
+    conn.execute("INSERT INTO oidc_login (state, verifier, nonce, return_to) VALUES (%s,%s,'-',%s)", (state, verifier, core.safe_next(next_url)))
     conn.commit()
     return f"{GITHUB_AUTHORIZE}?" + urlencode({"client_id": cfg["client_id"], "redirect_uri": redirect_uri, "scope": "read:user user:email",
                                               "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
