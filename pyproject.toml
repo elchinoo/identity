@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
-  "agentpg-kit>=0.2.0",
+  "agentpg-kit>=0.2.1",
   "authlib>=1.7",
   "joserfc>=1.0",
   "fastapi>=0.115",
