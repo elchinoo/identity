@@ -39,6 +39,8 @@ async def lifespan(_: FastAPI):
     try:
         with db.connect(retries=2) as conn:
             vault.try_unlock_with_platform_secret(conn)
+            if not vault.is_initialized(conn) and vault.initialize_with_platform_secret(conn):
+                conn.commit()                  # unattended first start: the platform secret alone protects the signing keys
             keys.ensure(conn)
             if local.needs_setup(conn):
                 _announce()

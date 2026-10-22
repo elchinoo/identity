@@ -129,3 +129,21 @@ def test_a_locked_vault_means_no_tokens_and_not_ready(idp):
     r = exchange(idp, code, pk[0], w["secret"])
     assert r.status_code == 503 and r.json()["error"] == "temporarily_unavailable" and r.headers["retry-after"] == "30"
     assert idp.get("/jwks.json").json()["keys"]                    # verifying existing tokens still works while locked
+
+
+def test_a_fresh_start_with_only_a_platform_secret_can_sign(env, monkeypatch):
+    """Unattended deployment (ecoctl): no admin password yet, but IDENTITY_ENCRYPTION_KEY and a static key are set."""
+    from identity import api, cli, core, keys
+    with core.db.connect() as c:
+        c.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+        c.commit()
+    cli.run_migrations()
+    core.vault.lock()
+    keys.forget()
+    api.reset_server()
+    monkeypatch.setenv("IDENTITY_ENCRYPTION_KEY", "platform-secret-for-the-test-0123456789")
+    monkeypatch.setenv("IDENTITY_API_KEY", "static-admin-key-for-the-test-0123456789")
+    with TestClient(api.app, base_url=BASE) as client:
+        assert client.get("/readyz").json() == {"status": "ready"}
+        assert client.get("/jwks.json").json()["keys"]
+    core.vault.lock()
