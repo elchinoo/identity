@@ -1,0 +1,17 @@
+main { max-width: 64rem; }
+.providers { display: grid; gap: .5rem; margin-top: 1rem; }
+a.button { display: block; text-align: center; text-decoration: none; border-radius: 10px; border: 1px solid var(--line); padding: .55rem 1rem; background: var(--surface); color: var(--text); }
+a.button:hover { border-color: var(--brand); }
+.launcher { display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: 1rem; }
+.app-tile { text-decoration: none; color: var(--text); }
+.app-tile h2 { margin: 0 0 .25rem; font-size: 1.1rem; }
+.app-tile:hover { border-color: var(--brand); }
+#who { margin-right: 1rem; }
+.stats { display: flex; flex-wrap: wrap; gap: .6rem; margin: .5rem 0 1rem; }
+.stat { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: .5rem .9rem; min-width: 7rem; }
+.stat strong { display: block; font-size: 1.4rem; line-height: 1.1; }
+.stat span { color: var(--muted); font-size: .85rem; }
+.badge.ok { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+.badge.bad { background: color-mix(in srgb, var(--err) 14%, transparent); color: var(--err); }
+td.wrap { white-space: normal; }
+.secret-box { word-break: break-all; }

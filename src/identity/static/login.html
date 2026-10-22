@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en" data-csrf="X-Identity-CSRF">
+<head>
+<meta charset="utf-8">
+<title>Sign in</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/kit/favicon.svg">
+<link rel="stylesheet" href="/kit/base.css">
+<link rel="stylesheet" href="/static/identity.css">
+</head>
+<body>
+<main>
+  <section id="card" class="card narrow">
+    <img class="hero-logo" src="/kit/logo.svg" alt="" width="72" height="72">
+    <h1>Sign in</h1>
+    <p id="message" class="muted"></p>
+    <p id="error" class="error" role="alert"></p>
+    <form id="form">
+      <label for="username">Username or e-mail</label>
+      <input id="username" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+      <button class="primary" type="submit">Sign in</button>
+    </form>
+    <div id="providers" class="providers"></div>
+  </section>
+</main>
+<script src="/static/login.js" type="module"></script>
+</body>
+</html>
