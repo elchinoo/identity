@@ -1,6 +1,6 @@
 import { api } from "/kit/api.js";
-import { refreshSession, renderLogin, renderSetup, renderVaultBanner, state } from "/kit/session.js";
-import { $, copy, field, fill, fmtDate, h, toast } from "/kit/ui.js";
+import { bootSession, renderLogin, renderSetup, renderVaultBanner, state } from "/kit/session.js";
+import { $, confirmDialog, copy, field, fill, fmtDate, h, promptDialog, toast } from "/kit/ui.js";
 
 const TABS = { overview: "Overview", users: "Users", groups: "Groups", apps: "Apps", federation: "Federation", keys: "Keys", audit: "Audit", settings: "Settings" };
 const VIEWS = { overview, users, groups, apps, federation, keys, audit, settings };
@@ -17,14 +17,16 @@ const csv = (v) => v.split(",").map((x) => x.trim()).filter(Boolean);
 // ---- boot --------------------------------------------------------------------------------------------------
 async function boot(notice = "") {
   for (const id of ["auth-card", "nav", "signout", "view", "vault-banner"]) $(id).hidden = true;
-  let s;
-  try { s = await refreshSession(); } catch (err) { fill($("auth-card"), h("h1", {}, "Identity can't be reached"), h("p", { class: "muted" }, err.message), h("button", { class: "primary", onclick: () => boot() }, "Retry")); $("auth-card").hidden = false; return; }
-  if (s.state === "setup_required") return renderSetup(() => boot(), PRODUCT);
-  if (s.state === "logged_out") return renderLogin(() => boot(), notice, PRODUCT);
-  $("nav").replaceChildren(...Object.entries(TABS).map(([k, label]) => h("a", { href: `#${k}`, "data-tab": k }, label)));
-  $("nav").hidden = $("signout").hidden = false;
-  renderVaultBanner();
-  route();
+  $("auth-card").hidden = false;   // bootSession paints the loading state (and a retry on failure) here
+  await bootSession($("auth-card"), { text: "Loading\u2026", onReady: (s) => {
+    if (s.state === "setup_required") return renderSetup(() => boot(), PRODUCT);
+    if (s.state === "logged_out") return renderLogin(() => boot(), notice, PRODUCT);
+    $("auth-card").hidden = true;
+    $("nav").replaceChildren(...Object.entries(TABS).map(([k, label]) => h("a", { href: `#${k}`, "data-tab": k }, label)));
+    $("nav").hidden = $("signout").hidden = false;
+    renderVaultBanner();
+    route();
+  } });
 }
 
 function route() {
@@ -73,8 +75,8 @@ async function users() {
     h("td", { class: "actions" }, h("div", { class: "btns" },
       btn("Roles", "secondary", () => userDetail(u.id)),
       btn(u.status === "active" ? "Disable" : "Enable", "secondary", async () => { try { await api(`/api/users/${u.id}`, { method: "PATCH", json: { status: u.status === "active" ? "disabled" : "active" } }); users(); } catch (e) { fail(e); } }),
-      btn("Password", "secondary", async () => { const p = prompt(`New password for ${u.username} (12+ characters)`); if (p) try { await api(`/api/users/${u.id}/password`, { method: "PUT", json: { password: p } }); toast("Password changed"); } catch (e) { fail(e); } }),
-      btn("Delete", "danger", async () => { if (confirm(`Delete ${u.username}?`)) try { await api(`/api/users/${u.id}`, { method: "DELETE" }); users(); } catch (e) { fail(e); } }))))), "No users yet."));
+      btn("Password", "secondary", async () => { const p = await promptDialog(`New password for ${u.username} (12+ characters)`, { title: "Change password", label: "New password", inputType: "password", required: true, confirmLabel: "Change password", validate: (v) => (v.length < 12 ? "Use at least 12 characters." : null) }); if (p) try { await api(`/api/users/${u.id}/password`, { method: "PUT", json: { password: p } }); toast("Password changed"); } catch (e) { fail(e); } }),
+      btn("Delete", "danger", async () => { if (await confirmDialog(`Delete ${u.username}?`, { title: "Delete user", confirmLabel: "Delete", danger: true })) try { await api(`/api/users/${u.id}`, { method: "DELETE" }); users(); } catch (e) { fail(e); } }))))), "No users yet."));
 }
 
 async function userDetail(id) {
@@ -99,7 +101,7 @@ async function groups() {
       const role = h("input", { placeholder: "role", maxlength: "40", size: "10" });
       return h("tr", {}, h("td", { class: "title" }, g.name), h("td", {}, String(g.members)),
         h("td", {}, h("div", { class: "btns" }, app, role, btn("Grant", "secondary", async () => { try { await api("/api/grants", { method: "POST", json: { subject_type: "group", subject: g.name, client_id: app.value, role: role.value } }); toast("Granted"); } catch (e) { fail(e); } }))),
-        h("td", { class: "actions" }, btn("Delete", "danger", async () => { if (confirm(`Delete group ${g.name}?`)) try { await api(`/api/groups/${g.name}`, { method: "DELETE" }); groups(); } catch (e) { fail(e); } })));
+        h("td", { class: "actions" }, btn("Delete", "danger", async () => { if (await confirmDialog(`Delete group ${g.name}?`, { title: "Delete group", confirmLabel: "Delete", danger: true })) try { await api(`/api/groups/${g.name}`, { method: "DELETE" }); groups(); } catch (e) { fail(e); } })));
     }), "No groups yet. Add people to groups with the Users tab (comma separated at creation)."));
 }
 
@@ -125,9 +127,9 @@ async function apps() {
     h("div", { class: "btns" }, h("button", { class: "primary", type: "submit" }, "Register"))),
     table(["App", "Kind", "URL", "Roles", "Grants", "Status", ""], list.map((a) => h("tr", {}, h("td", { class: "title" }, a.name, h("div", { class: "muted small-text" }, a.client_id)), h("td", {}, a.kind), h("td", { class: "wrap" }, a.url || ""),
       h("td", {}, String(a.roles)), h("td", {}, String(a.grants)), h("td", {}, h("span", { class: "badge " + (a.status === "active" ? "ok" : "bad") }, a.status)),
-      h("td", { class: "actions" }, h("div", { class: "btns" }, a.kind !== "public" ? btn("New secret", "secondary", async () => { if (confirm("The old secret stops working at once.")) try { showSecret(a.client_id, (await api(`/api/apps/${a.client_id}/secret`, { method: "POST" })).client_secret); } catch (e) { fail(e); } }) : null,
+      h("td", { class: "actions" }, h("div", { class: "btns" }, a.kind !== "public" ? btn("New secret", "secondary", async () => { if (await confirmDialog("The old secret stops working at once.", { title: "New secret", confirmLabel: "Issue new secret", danger: true })) try { showSecret(a.client_id, (await api(`/api/apps/${a.client_id}/secret`, { method: "POST" })).client_secret); } catch (e) { fail(e); } }) : null,
         btn(a.status === "active" ? "Disable" : "Enable", "secondary", async () => { try { await api(`/api/apps/${a.client_id}`, { method: "PATCH", json: { status: a.status === "active" ? "disabled" : "active" } }); apps(); } catch (e) { fail(e); } }),
-        btn("Delete", "danger", async () => { if (confirm(`Delete ${a.name}? Its grants go too.`)) try { await api(`/api/apps/${a.client_id}`, { method: "DELETE" }); apps(); } catch (e) { fail(e); } }))))), "No apps registered yet."));
+        btn("Delete", "danger", async () => { if (await confirmDialog(`Delete ${a.name}? Its grants go too.`, { title: "Delete app", confirmLabel: "Delete", danger: true })) try { await api(`/api/apps/${a.client_id}`, { method: "DELETE" }); apps(); } catch (e) { fail(e); } }))))), "No apps registered yet."));
 }
 
 function showSecret(clientId, secret) {
@@ -151,7 +153,7 @@ async function federation() {
       h("div", { class: "grid3" }, field("Mode", mode), field("Allowed e-mail domains (open mode)", domains), field("Default groups (open mode)", groupsIn)),
       h("label", { class: "check" }, on, " Enabled"),
       h("div", { class: "btns" }, h("button", { class: "primary", onclick: async () => { try { await api(`/api/federation/${id}`, { method: "PUT", json: { client_id: cid.value, client_secret: sec.value || null, enabled: on.checked, mode: mode.value, allowed_domains: csv(domains.value), default_groups: csv(groupsIn.value) } }); toast("Saved"); federation(); } catch (e) { fail(e); } } }, "Save"),
-        cur ? h("button", { class: "danger", onclick: async () => { if (confirm(`Remove ${label} sign-in and its links?`)) { await api(`/api/federation/${id}`, { method: "DELETE" }); federation(); } } }, "Remove") : null));
+        cur ? h("button", { class: "danger", onclick: async () => { if (await confirmDialog(`Remove ${label} sign-in and its links?`, { title: "Remove sign-in", confirmLabel: "Remove", danger: true })) { await api(`/api/federation/${id}`, { method: "DELETE" }); federation(); } } }, "Remove") : null));
   });
   fill($("view"), h("h1", {}, "Federation"), h("p", { class: "muted" }, "People can sign in with an account they already have. A verified e-mail address links them to their user here; an unverified one never does."), ...forms);
 }
@@ -160,7 +162,7 @@ async function keys() {
   const list = await api("/api/keys");
   fill($("view"), h("h1", {}, "Signing keys"), h("p", { class: "muted" }, "Tokens are signed with the active key. After a rotation the old key stays published for 24 hours so tokens already issued still verify."),
     table(["Key id", "Algorithm", "Status", "Created", "Retires"], list.map((k) => h("tr", {}, h("td", {}, h("code", {}, k.kid)), h("td", {}, k.alg), h("td", {}, k.status), h("td", {}, fmtDate(k.created_at)), h("td", {}, k.retire_at ? fmtDate(k.retire_at) : ""))), "No signing key yet: unlock the vault."),
-    h("div", { class: "btns" }, h("button", { class: "secondary", onclick: async () => { if (confirm("Create a new signing key?")) try { await api("/api/keys/rotate", { method: "POST" }); keys(); } catch (e) { fail(e); } } }, "Rotate key")));
+    h("div", { class: "btns" }, h("button", { class: "secondary", onclick: async () => { if (await confirmDialog("Create a new signing key?", { title: "Rotate key", confirmLabel: "Rotate key" })) try { await api("/api/keys/rotate", { method: "POST" }); keys(); } catch (e) { fail(e); } } }, "Rotate key")));
 }
 
 async function audit() {
