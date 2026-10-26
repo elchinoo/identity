@@ -7,6 +7,7 @@ a.button:hover { border-color: var(--brand); }
 .app-tile h2 { margin: 0 0 .25rem; font-size: 1.1rem; }
 .app-tile:hover { border-color: var(--brand); }
 #who { margin-right: 1rem; }
+.card > h2 { margin: 0 0 .5rem; font-size: 1.05rem; }
 .stats { display: flex; flex-wrap: wrap; gap: .6rem; margin: .5rem 0 1rem; }
 .stat { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: .5rem .9rem; min-width: 7rem; }
 .stat strong { display: block; font-size: 1.4rem; line-height: 1.1; }

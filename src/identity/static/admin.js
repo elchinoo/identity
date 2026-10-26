@@ -1,13 +1,13 @@
 import { api } from "/kit/api.js";
 import { bootSession, renderLogin, renderSetup, renderVaultBanner, state } from "/kit/session.js";
-import { $, confirmDialog, copy, field, fill, fmtDate, h, promptDialog, toast } from "/kit/ui.js";
+import { $, confirmDialog, copy, field, fill, fmtDate, h, promptDialog, scrollRegion, toast } from "/kit/ui.js";
 
 const TABS = { overview: "Overview", users: "Users", groups: "Groups", apps: "Apps", federation: "Federation", keys: "Keys", audit: "Audit", settings: "Settings" };
 const VIEWS = { overview, users, groups, apps, federation, keys, audit, settings };
 const PRODUCT = "Identity";
 
 function table(heads, rows, empty = "Nothing yet.") {
-  return rows.length ? h("div", { class: "card flush" }, h("table", {}, h("thead", {}, h("tr", {}, ...heads.map((t) => h("th", {}, t)))), h("tbody", {}, ...rows)))
+  return rows.length ? h("div", { class: "card flush" }, h("table", {}, h("thead", {}, h("tr", {}, ...heads.map((t) => h("th", {}, t || h("span", { class: "sr-only" }, "Actions"))))), h("tbody", {}, ...rows)))
     : h("div", { class: "card" }, h("p", { class: "empty" }, empty));
 }
 const fail = (e) => toast(e.message, true);
@@ -48,8 +48,8 @@ async function overview() {
   fill($("view"), h("h1", {}, "Overview"),
     h("div", { class: "stats" }, stat(d.active_users + "/" + d.users, "active users"), stat(d.groups, "groups"), stat(d.apps, "apps"), stat(d.grants, "role grants"), stat(d.live_refresh_tokens, "live refresh tokens")),
     !state.session.signing_key ? h("div", { class: "banner" }, "There is no signing key yet: unlock the vault (sign in with the admin password, or set IDENTITY_ENCRYPTION_KEY) so tokens can be issued.") : null,
-    h("div", { class: "card" }, h("h3", {}, "How apps connect"),
-      h("p", { class: "muted" }, "Discovery document:"), h("pre", { class: "code" }, h("code", {}, `${location.origin}/.well-known/openid-configuration`)),
+    h("div", { class: "card" }, h("h2", {}, "How apps connect"),
+      h("p", { class: "muted" }, "Discovery document:"), scrollRegion(h("pre", { class: "code" }, h("code", {}, `${location.origin}/.well-known/openid-configuration`)), "Discovery document URL"),
       h("p", { class: "muted" }, "Register an app under Apps, give people roles in it, and point the app at this issuer. Sign-in for people is at /login; their launcher is /apps.")),
     h("p", { class: "muted" }, `Sign-in providers: ${d.providers.map((p) => p.label).join(", ") || "none (password only)"}.`));
 }
@@ -64,7 +64,7 @@ async function users() {
       toast("User created"); users();
     } catch (err) { fail(err); }
   } },
-  h("h3", {}, "Add a person"),
+  h("h2", {}, "Add a person"),
   h("div", { class: "grid3" }, field("Username", h("input", { name: "username", required: true, maxlength: "64" })), field("E-mail", h("input", { name: "email", type: "email", required: true })), field("Name", h("input", { name: "name", maxlength: "120" }))),
   h("div", { class: "grid2" }, field("Password (optional)", h("input", { name: "password", type: "password", autocomplete: "new-password" }), "12+ characters. Leave empty if they will sign in with Google or GitHub."),
     field("Groups (comma separated)", h("input", { name: "groups" }))),
@@ -86,7 +86,7 @@ async function userDetail(id) {
   fill($("view"), h("p", {}, h("a", { href: "#users" }, "← users")), h("h1", {}, u.username),
     h("p", { class: "muted" }, `${u.name} · ${u.email} · groups: ${u.groups.join(", ") || "none"} · federated: ${u.federated.map((f) => f.provider).join(", ") || "no"}`),
     table(["App", "Role", ""], u.grants.map((g) => h("tr", {}, h("td", {}, g.client_id), h("td", {}, g.role), h("td", { class: "actions" }, btn("Remove", "danger", async () => { try { await api(`/api/grants/${g.id}`, { method: "DELETE" }); userDetail(id); } catch (e) { fail(e); } })))), "No direct roles. Groups and app defaults may still grant some."),
-    h("div", { class: "card" }, h("h3", {}, "Grant a role"), h("div", { class: "grid3" }, field("App", app), field("Role", role),
+    h("div", { class: "card" }, h("h2", {}, "Grant a role"), h("div", { class: "grid3" }, field("App", app), field("Role", role),
       h("div", { class: "btns" }, h("button", { class: "primary", onclick: async () => { try { await api("/api/grants", { method: "POST", json: { subject_type: "user", subject: id, client_id: app.value, role: role.value } }); userDetail(id); } catch (e) { fail(e); } } }, "Grant")))));
 }
 
@@ -97,8 +97,8 @@ async function groups() {
     h("form", { class: "card", onsubmit: async (e) => { e.preventDefault(); try { await api("/api/groups", { method: "POST", json: { name: name.value } }); groups(); } catch (err) { fail(err); } } },
       h("div", { class: "grid-inline" }, field("New group", name), h("span"), h("button", { class: "primary", type: "submit" }, "Create"))),
     table(["Group", "Members", "Grant a role to the whole group", ""], list.map((g) => {
-      const app = h("select", {}, ...appList.map((a) => h("option", { value: a.client_id }, a.name)));
-      const role = h("input", { placeholder: "role", maxlength: "40", size: "10" });
+      const app = h("select", { "aria-label": `App for group ${g.name}` }, ...appList.map((a) => h("option", { value: a.client_id }, a.name)));
+      const role = h("input", { placeholder: "role", maxlength: "40", size: "10", "aria-label": `Role to grant to group ${g.name}` });
       return h("tr", {}, h("td", { class: "title" }, g.name), h("td", {}, String(g.members)),
         h("td", {}, h("div", { class: "btns" }, app, role, btn("Grant", "secondary", async () => { try { await api("/api/grants", { method: "POST", json: { subject_type: "group", subject: g.name, client_id: app.value, role: role.value } }); toast("Granted"); } catch (e) { fail(e); } }))),
         h("td", { class: "actions" }, btn("Delete", "danger", async () => { if (await confirmDialog(`Delete group ${g.name}?`, { title: "Delete group", confirmLabel: "Delete", danger: true })) try { await api(`/api/groups/${g.name}`, { method: "DELETE" }); groups(); } catch (e) { fail(e); } })));
@@ -119,7 +119,7 @@ async function apps() {
         if (r.client_secret) showSecret(d.client_id, r.client_secret); else { toast("App registered"); apps(); }
       } catch (err) { fail(err); }
     } },
-    h("h3", {}, "Register an app"),
+    h("h2", {}, "Register an app"),
     h("div", { class: "grid3" }, field("Client id", f("client_id", { required: true, maxlength: "40", placeholder: "trustdesk" }), "Also the role namespace in tokens."), field("Name", f("name", { required: true })), field("Kind", kind)),
     h("div", { class: "grid2" }, field("App URL", f("url", { placeholder: "https://…" })), field("Redirect URIs (comma separated)", f("redirects", { placeholder: "https://app/auth/callback" }), "Exact match. https, or http on localhost.")),
     h("div", { class: "grid3" }, field("Roles it defines", f("roles", { placeholder: "admin, approver, viewer" })), field("Default roles (everyone)", f("defaults")), field("Post-logout URIs", f("logout"))),
@@ -134,7 +134,7 @@ async function apps() {
 
 function showSecret(clientId, secret) {
   fill($("view"), h("h1", {}, `Secret for ${clientId}`), h("div", { class: "banner" }, "This is the only time the secret is shown. Put it in the app's environment (or a mounted file), never in a repository."),
-    h("pre", { class: "code secret-box" }, h("code", {}, secret)), h("div", { class: "btns" }, h("button", { class: "primary", onclick: () => copy(secret) }, "Copy"), h("button", { class: "secondary", onclick: () => { location.hash = "#apps"; apps(); } }, "Done")));
+    scrollRegion(h("pre", { class: "code secret-box" }, h("code", {}, secret)), "Secret value"), h("div", { class: "btns" }, h("button", { class: "primary", onclick: () => copy(secret) }, "Copy"), h("button", { class: "secondary", onclick: () => { location.hash = "#apps"; apps(); } }, "Done")));
 }
 
 async function federation() {
@@ -148,7 +148,7 @@ async function federation() {
     const domains = h("input", { value: (cur?.allowed_domains || []).join(", ") });
     const groupsIn = h("input", { value: (cur?.default_groups || []).join(", ") });
     const on = h("input", { type: "checkbox", checked: cur ? cur.enabled : true });
-    return h("div", { class: "card" }, h("h3", {}, label), h("p", { class: "muted small-text" }, `Callback URL to register at ${label}: ${location.origin}/login/${id}/callback`),
+    return h("div", { class: "card" }, h("h2", {}, label), h("p", { class: "muted small-text" }, `Callback URL to register at ${label}: ${location.origin}/login/${id}/callback`),
       h("div", { class: "grid2" }, field("Client id", cid), field("Client secret", sec)),
       h("div", { class: "grid3" }, field("Mode", mode), field("Allowed e-mail domains (open mode)", domains), field("Default groups (open mode)", groupsIn)),
       h("label", { class: "check" }, on, " Enabled"),
@@ -177,7 +177,7 @@ async function settings() {
   const cur = h("input", { type: "password", autocomplete: "current-password" });
   const nw = h("input", { type: "password", autocomplete: "new-password" });
   fill($("view"), h("h1", {}, "Settings"),
-    h("div", { class: "card" }, h("h3", {}, "Admin password"), h("div", { class: "grid2" }, field("Current", cur), field("New (12+ characters)", nw)),
+    h("div", { class: "card" }, h("h2", {}, "Admin password"), h("div", { class: "grid2" }, field("Current", cur), field("New (12+ characters)", nw)),
       h("div", { class: "btns" }, h("button", { class: "primary", onclick: async () => { try { await api("/api/admin-password", { method: "POST", json: { current: cur.value || null, new: nw.value } }); toast("Changed. Signing you out everywhere."); boot(); } catch (e) { fail(e); } } }, "Change password"))),
     h("h2", { class: "section-title" }, "Operator tokens"),
     h("form", { class: "card", onsubmit: async (e) => { e.preventDefault(); try { const t = await api("/api/tokens", { method: "POST", json: { name: name.value, scope: scope.value } }); showSecret("operator token", t.token); } catch (err) { fail(err); } } },
