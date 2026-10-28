@@ -257,3 +257,22 @@ def test_a_long_authorization_url_survives_the_login_round_trip(idp):
     from identity import core
     assert core.safe_next(long_next) == long_next and core.safe_next("/" + "a" * 3000) == "/"
     assert core.safe_next("//evil.example") == "/" and core.safe_next("https://evil.example") == "/" and core.safe_next("/a\\b") == "/"
+
+
+def test_another_replica_rotating_the_signing_key_is_noticed_within_the_cache_ttl(idp, monkeypatch):
+    """The key cache is per process: a rotation done by another process must be picked up after keys.CACHE_TTL, not only at restart."""
+    from identity import core, keys
+    clock = [1000.0]
+    monkeypatch.setattr(keys, "_now", lambda: clock[0])
+    keys.forget()
+    with core.db.connect() as conn:
+        first = keys.signing_key(conn).kid
+        assert keys.signing_key(conn).kid == first
+        mine = dict(keys._cache)
+        other = keys.rotate(conn)                              # "another replica" rotates (this also clears our cache)...
+        keys._cache.update(mine)                               # ...so put back what a process that did not see it still holds
+        clock[0] += keys.CACHE_TTL - 1
+        assert keys.signing_key(conn).kid == first             # still inside the TTL: no database round trip is needed
+        clock[0] += 2
+        assert keys.signing_key(conn).kid == other             # past the TTL: the new active key
+        assert keys.can_sign(conn)

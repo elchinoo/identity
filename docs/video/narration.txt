@@ -1,0 +1,197 @@
+## 1 af_bella
+Every app you build has to answer two questions.
+
+Who is this person?
+
+...
+
+And what may they do here?
+
+Without a shared answer, every app keeps its own list of users and passwords.
+
+Identity is the one place that answers for the whole ecosystem.
+
+People sign in once. Each app lists its roles. Administrators decide who holds them.
+
+In this video we will set it up, connect an app, and see what the app receives.
+
+## 2 af_bella
+Identity is one small service, with a Postgres database behind it.
+
+On first start, it prints a one-time setup code in its log. Only whoever runs the server can read it.
+
+...
+
+Now the admin page. We paste the code, and choose an administrator password.
+
+[pause 4.5]
+
+That password also protects the vault, an encrypted store for secrets, such as signing keys. It needs at least twelve characters.
+
+## 3 am_eric
+Next, some sample data. A small script adds three people and one group.
+
+[pause 1.0]
+
+Back in the console, the overview counts people, groups and apps.
+
+Here are the people: Ada, Grace and Alan.
+
+A group is a named set of people. We have one, called writers, with Ada in it.
+
+## 4 am_eric
+Now we register an app, a small notes application.
+
+Its client id is notes. That is also the name its roles live under.
+
+[pause 1.0]
+
+The kind is web: a server-side app that can keep a secret.
+
+[pause 2.0]
+
+The redirect address is exact. Identity only sends people back to precisely this address.
+
+...
+
+We define two roles, editor and reader. Reader is the default, so everyone can at least read.
+
+[pause 1.0]
+
+Now Identity shows the app's secret, once. If it is lost, you issue a new one.
+
+We copy it, and start the app with that secret.
+
+[pause 3.0]
+
+The app is running.
+
+## 5 am_eric
+Now, the access.
+
+On the writers group, we grant the editor role in Notes.
+
+[pause 1.5]
+
+Everyone in writers now holds it.
+
+...
+
+Next, Grace. She is not in writers, and has no direct grant.
+
+So she will only hold the default role: reader.
+
+Roles always belong to one app. Editor in Notes says nothing about any other app.
+
+## 6 af_bella
+Now the sign-in flow, the part people see.
+
+The app sends the browser to Identity.
+
+Grace signs in there, on Identity's own page. So the app never sees her password.
+
+[pause 1.5]
+
+Identity sends her back with a one-time code. The app swaps it for tokens, using its secret and a random check value called PKCE.
+
+...
+
+Notes now knows her name and her roles. She is a reader, so the page says read only.
+
+[pause 1.0]
+
+Now she signs out. That ends her session at Identity too.
+
+Now Ada signs in.
+
+[pause 4.0]
+
+Ada holds the editor role, so she can edit notes.
+
+...
+
+Identity also has a launcher page. It lists every app a person may open, with their roles.
+
+## 7 af_bella
+Back on the Notes page, this box shows what the app received. These are the claims of Ada's ID token.
+
+The app did not call Identity to ask who she is. The token is signed, and the app checks that signature.
+
+It checks the issuer, which is Identity.
+
+And the audience, which is this app and no other.
+
+The roles inside are only the ones for Notes.
+
+...
+
+The signature check uses Identity's public keys. The app finds them through the discovery document.
+
+[pause 2.0]
+
+That document lists every address an app needs. The keys are published here.
+
+[pause 2.0]
+
+So connecting an app takes just three settings. Where Identity is. The client id. And the secret.
+
+## 8 am_michael
+Now, services. They need to sign in too, with no person involved.
+
+We register a service, a background worker, and say exactly what it may ask for. The scope notes.write, for the notes app only.
+
+[pause 3.5]
+
+It gets its own secret. We copy it.
+
+[pause 1.0]
+
+Now the worker asks for a token.
+
+[pause 2.5]
+
+The subject is the worker, marked as a service. The audience is notes. The scope is notes.write.
+
+...
+
+Now it asks for a scope it was never given.
+
+[pause 1.5]
+
+Identity refuses: invalid scope.
+
+This replaces copying one shared password around. Tokens last ten minutes.
+
+## 9 am_michael
+Day to day, three things matter.
+
+First, people. We disable Alan.
+
+[pause 1.0]
+
+Now he cannot sign in. His long-lived sessions end at once, and tokens he already holds expire within ten minutes.
+
+[pause 3.0]
+
+Second, the signing keys. Here is the active one. We rotate it.
+
+[pause 2.0]
+
+The new key is active. The old one is retiring, and stays published for twenty-four hours. Nothing breaks mid-flight.
+
+[pause 1.0]
+
+Third, the audit page. It records who changed what, in the same step as the change.
+
+## 10 af_bella
+To recap what we covered. Sign in once. Roles per app. Exact redirect addresses.
+
+Signed tokens that apps check on their own. And service credentials with narrow scopes.
+
+...
+
+Everything you saw is in the guide, in the docs folder.
+
+Clone the repository, start it on a throwaway database, and register your own first app.
+
+Thanks for watching.

@@ -37,12 +37,15 @@ def _announce() -> None:
 async def lifespan(_: FastAPI):
     try:
         with db.connect(retries=2) as conn:
+            core.check_encoding(conn)
             vault.try_unlock_with_platform_secret(conn)
             if not vault.is_initialized(conn) and vault.initialize_with_platform_secret(conn):
                 conn.commit()                  # unattended first start: the platform secret alone protects the signing keys
             keys.ensure(conn)
             if local.needs_setup(conn):
                 _announce()
+    except core.DatabaseEncodingError as exc:
+        print(f"\n!!! {exc}\n", file=sys.stderr, flush=True)       # /readyz reports it too; do not hide it behind "waking"
     except Exception:  # noqa: BLE001 - the database may be asleep; everything retries on the first request
         pass
     yield
@@ -87,9 +90,11 @@ def healthz():
 def readyz():
     try:
         with db.connect(retries=1) as conn:
-            conn.execute("SELECT 1")
+            core.check_encoding(conn)
             ready = keys.can_sign(conn)
         return {"status": "ready"} if ready else JSONResponse({"status": "locked", "detail": "no signing key: unlock the vault"}, status_code=503)
+    except core.DatabaseEncodingError as exc:
+        return JSONResponse({"status": "bad-database-encoding", "detail": str(exc)}, status_code=503)
     except Exception:  # noqa: BLE001
         return JSONResponse({"status": "waking-database"}, status_code=503)
 

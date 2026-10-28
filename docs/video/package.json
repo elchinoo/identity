@@ -1,0 +1,13 @@
+{
+  "name": "identity-video-recorder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Plays docs/VIDEO-SCRIPT.md in a real browser on a throwaway local database, with Playwright video on. Local only.",
+  "scripts": {
+    "record": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/node": "26.6.5"
+  }
+}

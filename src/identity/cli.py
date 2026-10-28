@@ -5,14 +5,15 @@ import sys
 from apgkit import migrate as kit_migrate
 from apgkit.auth.schema import SQL as AUTH_SQL
 
-from . import core
+from . import core, hardening
 
 
 def run_migrations() -> list[str]:
     with core.db.connect() as conn:
+        core.check_encoding(conn)                    # before anything is created in a database Identity cannot use
         conn.execute(AUTH_SQL)
         conn.commit()
-    return kit_migrate.run(core.db, core.MIGRATIONS, table="identity_migrations")
+    return kit_migrate.run(core.db, core.MIGRATIONS, table="identity_migrations", after_migrate=[hardening.apply])
 
 
 def _serve() -> None:
@@ -31,13 +32,20 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("reset-admin", help="forget the admin password and vault (recovery)")
     args = p.parse_args(argv)
     if args.cmd == "migrate":
-        applied = run_migrations()
+        try:
+            applied = run_migrations()
+        except core.DatabaseEncodingError as exc:
+            print(f"migrate failed: {exc}", file=sys.stderr)
+            return 1
         print("applied:", ", ".join(applied) if applied else "nothing (up to date)")
     elif args.cmd == "serve":
         _serve()
     elif args.cmd == "start":
         try:
             applied = run_migrations()
+        except core.DatabaseEncodingError as exc:
+            print(f"startup failed: {exc}", file=sys.stderr)
+            return 1
         except Exception as exc:  # noqa: BLE001
             print(f"startup failed while migrating: {exc}\nCheck that the database is reachable. If it mentions an extension, "
                   "enable it first: agentpg extensions create <instance-id> pgcrypto", file=sys.stderr)

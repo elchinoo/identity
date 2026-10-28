@@ -6,7 +6,6 @@ from apgkit import metrics as metrics_mod
 from apgkit.auth import AppAuth, Authenticator, LocalAuth
 from apgkit.config import env_bool
 from apgkit.db import Database
-from apgkit.netguard import NetGuard
 from apgkit.ratelimit import FailureLimiter
 from apgkit.vault import Vault
 
@@ -17,18 +16,42 @@ APP = "identity"
 COOKIE_ADMIN, COOKIE_SSO = "idp_admin", "idp_sso"
 CSRF_HEADER = "x-identity-csrf"
 
-db = Database(pool_max=int(os.environ.get("IDENTITY_POOL_MAX", "20")))
+db = Database()                                              # plain connections, one per request: there is no pool to size
 vault = Vault("IDENTITY")
-netguard = NetGuard("IDENTITY_ALLOW_PRIVATE_URLS")
 metrics = metrics_mod.Metrics(APP, __version__)
+
+
+def _db_probe() -> dict[str, float]:
+    with db.connect(retries=1) as conn:
+        conn.execute("SELECT 1")
+    return {"db_up": 1}
+
+
+metrics.add_insights_collector(lambda: db.connect(retries=1))  # db_insights_* gauges (EDB query statistics), cached; db_insights_available 0 on plain Postgres
+metrics.add_db_collector(_db_probe)                          # db_up is 1 when a connection and a trivial query work, else 0
 login_limiter = FailureLimiter(window=300, limit=10)        # sign-in failures per client address / per username
 
 # The operator console is governed by one permission set; the local admin password (always available, never federated)
-# holds everything. Operator tokens: `read` can look but not change, `metrics` only scrapes.
-APP_AUTH = AppAuth(APP, APP, role_permissions={"admin": frozenset({"*"}), "auditor": frozenset({"admin:read"})},
+# holds everything. Operator tokens: `read` can look but not change, `metrics` only scrapes. There is no role for a federated
+# person: the console never verifies federated tokens, so a role could not be held by anyone.
+APP_AUTH = AppAuth(APP, APP, role_permissions={"admin": frozenset({"*"})},
                    scope_permissions={"full": frozenset({"*"}), "read": frozenset({"admin:read"}), "metrics": frozenset({"metrics:scrape"})})
 local = LocalAuth(APP_AUTH, env_prefix="IDENTITY", token_prefix="idt_", token_scopes={"read", "metrics", "full"}, vault=vault)
 auth = Authenticator(APP_AUTH, local, db, cookie_name=COOKIE_ADMIN, allow_anonymous=env_bool("IDENTITY_ALLOW_ANONYMOUS"))
+
+
+class DatabaseEncodingError(RuntimeError):
+    """The database is not UTF-8. On SQL_ASCII, text comes back as bytes and, among other things, the admin password check fails."""
+
+
+def check_encoding(conn) -> None:
+    """Raise DatabaseEncodingError unless the database encoding is UTF8."""
+    value = next(iter(conn.execute("SHOW server_encoding").fetchone().values()))
+    encoding = value.decode("ascii", "replace") if isinstance(value, bytes) else str(value)
+    if encoding.upper() not in {"UTF8", "UTF-8"}:
+        raise DatabaseEncodingError(f"the database encoding is {encoding}, but Identity needs UTF8 (with {encoding} text comes back as bytes "
+                                    "and sign-in fails with 'invalid credentials'). Create the database with ENCODING 'UTF8' "
+                                    "(CREATE DATABASE identity ENCODING 'UTF8' TEMPLATE template0) and point DATABASE_URL at it.")
 
 
 def issuer(public_url: str) -> str:

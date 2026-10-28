@@ -1,6 +1,7 @@
 """The operator console API: users, groups, apps, role grants, signing keys, federation providers and the audit trail."""
 import contextlib
 
+from apgkit import insights
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -110,6 +111,13 @@ def build_router(auth, keys_forget) -> APIRouter:
             counts["signing_keys"] = keys.list_keys(conn)
             counts["providers"] = federation.enabled(conn)
         return counts
+
+    # ---- database insights (EDB edb_stat_monitor / edb_pg_tuner / query_advisor; degrades to "not available" on plain Postgres) ----
+    @r.get("/insights", dependencies=[write])        # statement text shows table names and workload shape: full admin only
+    def database_insights(order: str = "total", limit: int = 20):
+        order = order if order in ("total", "mean", "calls") else "total"
+        with db.connect() as conn:
+            return insights.insights_payload(conn, order, max(1, min(limit, 200)))
 
     # ---- users ----
     @r.get("/users", dependencies=[read])

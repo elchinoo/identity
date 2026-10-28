@@ -46,11 +46,18 @@ such as `trustdesk`. Scopes address one audience app by their prefix.
 
 | Variable | Meaning |
 |---|---|
-| `DATABASE_URL` / `DB_EXTERNAL_DSN` / `PSQL_CONNECTION_STRING` | Postgres. |
+| `DATABASE_URL` / `DB_EXTERNAL_DSN` / `PSQL_CONNECTION_STRING` | Postgres, which must be a UTF-8 database. |
 | `IDENTITY_PUBLIC_URL`, `IDENTITY_ISSUER` | The URL the provider is reached at; it becomes the token issuer, so set it once and keep it. Default: the first request's address. |
 | `IDENTITY_ENCRYPTION_KEY[_FILE]` | Platform secret that unlocks the vault (signing keys, provider secrets) at startup. |
 | `IDENTITY_API_KEY[_FILE]` | Optional static full-access key for automation. |
-| `IDENTITY_ALLOW_PRIVATE_URLS` | Allow loopback/private targets for outbound calls (local testing only). |
+
+## Documentation
+
+The complete guide is [docs/GUIDE.md](docs/GUIDE.md): how Identity fits the ecosystem, architecture, install, every setting,
+feature-by-feature usage, operations and troubleshooting, including the **Database** insights tab and read-only/AI access
+([7.10](docs/GUIDE.md#710-database-insights-console-database), [7.11](docs/GUIDE.md#711-what-a-read-only-database-user-and-agentpgs-restricted-mcp-can-see),
+[EDB and AgentPG capabilities used](docs/GUIDE.md#13b-edb-and-agentpg-capabilities-used-by-this-app)). A tutorial video script (with reproducible seed data) is in
+[docs/VIDEO-SCRIPT.md](docs/VIDEO-SCRIPT.md); `docs/video/` holds the Playwright recorder that plays it.
 
 ## Security notes
 

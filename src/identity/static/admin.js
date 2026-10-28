@@ -1,9 +1,10 @@
 import { api } from "/kit/api.js";
 import { bootSession, renderLogin, renderSetup, renderVaultBanner, state } from "/kit/session.js";
+import { initInsights } from "/kit/insights.js";
 import { $, confirmDialog, copy, field, fill, fmtDate, h, promptDialog, scrollRegion, toast } from "/kit/ui.js";
 
-const TABS = { overview: "Overview", users: "Users", groups: "Groups", apps: "Apps", federation: "Federation", keys: "Keys", audit: "Audit", settings: "Settings" };
-const VIEWS = { overview, users, groups, apps, federation, keys, audit, settings };
+const TABS = { overview: "Overview", users: "Users", groups: "Groups", apps: "Apps", federation: "Federation", keys: "Keys", audit: "Audit", insights: "Database", settings: "Settings" };
+const VIEWS = { overview, users, groups, apps, federation, keys, audit, insights, settings };
 const PRODUCT = "Identity";
 
 function table(heads, rows, empty = "Nothing yet.") {
@@ -168,6 +169,10 @@ async function keys() {
 async function audit() {
   const rows = await api("/api/audit");
   fill($("view"), h("h1", {}, "Audit"), table(["When", "Who", "What", "Target", "Detail"], rows.map((r) => h("tr", {}, h("td", {}, new Date(r.at).toLocaleString()), h("td", {}, r.actor), h("td", {}, r.action.replaceAll("_", " ")), h("td", {}, r.target), h("td", { class: "wrap muted" }, JSON.stringify(r.detail) === "{}" ? "" : JSON.stringify(r.detail)))), "Nothing yet."));
+}
+
+async function insights() {
+  await initInsights($("view"), api);          // the kit renders its own h1 ("Query insights")
 }
 
 async function settings() {

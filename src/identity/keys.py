@@ -4,6 +4,7 @@ Rotation: a new key becomes active and signs from then on; the old one stays in 
 tokens already issued still verify, then is retired and dropped from it. Apps refetch the JWKS when they see an unknown `kid`.
 """
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 from joserfc.jwk import RSAKey
@@ -14,7 +15,11 @@ from .ids import new_kid
 
 RETIRE_AFTER = timedelta(hours=24)
 _lock = threading.Lock()
-_cache: dict = {"kid": None, "key": None}
+_cache: dict = {"kid": None, "key": None, "at": 0.0}
+# Another replica may rotate the key. A process re-reads which key is active from the database at most this often, so it
+# follows a rotation made elsewhere within CACHE_TTL seconds (the rotated-out key stays published for 24 hours, so nothing breaks).
+CACHE_TTL = 30.0
+_now = time.monotonic                                       # tests replace this
 
 
 def _generate(kid: str) -> RSAKey:
@@ -40,27 +45,31 @@ def rotate(conn, first: bool = False) -> str:
     conn.execute("UPDATE signing_key SET status='retired' WHERE status='retiring' AND retire_at < now()")
     conn.commit()
     with _lock:
-        _cache.update(kid=None, key=None)
+        _cache.update(kid=None, key=None, at=0.0)
     return kid
 
 
 def signing_key(conn) -> RSAKey:
-    """The active private key (decrypted once, then cached in memory)."""
+    """The active private key: decrypted once and cached in memory; the active kid is re-checked in the database every CACHE_TTL seconds."""
     with _lock:
-        if _cache["key"] is not None:
+        if _cache["key"] is not None and _now() - _cache["at"] < CACHE_TTL:
             return _cache["key"]
     row = conn.execute("SELECT kid, private_enc FROM signing_key WHERE status='active' ORDER BY created_at DESC LIMIT 1").fetchone()
     if not row:
         raise RuntimeError("no signing key: unlock the vault (sign in as the admin or set IDENTITY_ENCRYPTION_KEY)")
+    with _lock:
+        if _cache["key"] is not None and _cache["kid"] == row["kid"]:       # still the same key: just start a new interval
+            _cache["at"] = _now()
+            return _cache["key"]
     key = RSAKey.import_key(core.vault.decrypt(row["private_enc"]), {"kid": row["kid"], "use": "sig", "alg": "RS256"})
     with _lock:
-        _cache.update(kid=row["kid"], key=key)
+        _cache.update(kid=row["kid"], key=key, at=_now())
     return key
 
 
 def forget() -> None:
     with _lock:
-        _cache.update(kid=None, key=None)
+        _cache.update(kid=None, key=None, at=0.0)
 
 
 def jwks(conn) -> dict:
@@ -76,9 +85,10 @@ def list_keys(conn) -> list[dict]:
 
 def can_sign(conn) -> bool:
     """True if a token could be signed right now: an active key exists and its private half is readable (cached or vault unlocked)."""
-    if ensure(conn) is None:
+    kid = ensure(conn)
+    if kid is None:
         return False
     with _lock:
-        if _cache["key"] is not None:
+        if _cache["key"] is not None and _cache["kid"] == kid:
             return True
     return core.vault.is_unlocked()

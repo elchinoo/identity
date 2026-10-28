@@ -1,5 +1,6 @@
 """The operator console API, its boundaries, and the login surface."""
-from conftest import BASE, CSRF, PASSWORD, login_sso, make_world
+import pytest
+from conftest import BASE, CSRF, PASSWORD, TEST_URL, login_sso, make_world
 from fastapi.testclient import TestClient
 
 
@@ -147,3 +148,61 @@ def test_a_fresh_start_with_only_a_platform_secret_can_sign(env, monkeypatch):
         assert client.get("/readyz").json() == {"status": "ready"}
         assert client.get("/jwks.json").json()["keys"]
     core.vault.lock()
+
+
+def test_metrics_report_db_up(idp, monkeypatch):
+    from identity import core
+    body = idp.get("/metrics").text
+    assert 'db_up{app="identity"} 1.0' in body and "http_requests_total" in body
+    monkeypatch.setattr(core.db, "_url", lambda: "postgresql://nobody@127.0.0.1:1/none")      # nothing listens there
+    body, _ = core.metrics.render()                                                       # (the HTTP route authenticates through the database)
+    assert b'db_up{app="identity"} 0.0' in body                                           # a render never fails because the database is down
+
+
+def test_a_database_that_is_not_utf8_is_refused_with_a_clear_message(env, monkeypatch, capsys):
+    """On SQL_ASCII text comes back as bytes and the admin password check fails silently; say so instead."""
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    from identity import api, cli, core
+    name = "identity_asciitest"
+    admin_dsn = make_conninfo(TEST_URL, dbname=conninfo_to_dict(TEST_URL).get("dbname"))
+    with psycopg.connect(admin_dsn, autocommit=True) as c:
+        c.execute(f"DROP DATABASE IF EXISTS {name}")
+        try:
+            c.execute(f"CREATE DATABASE {name} ENCODING 'SQL_ASCII' TEMPLATE template0")
+        except psycopg.Error as exc:
+            pytest.skip(f"cannot create a SQL_ASCII database here: {exc}")
+    try:
+        monkeypatch.setenv("DATABASE_URL", make_conninfo(TEST_URL, dbname=name))
+        assert cli.main(["migrate"]) == 1 and "SQL_ASCII" in capsys.readouterr().err
+        r = TestClient(api.app, base_url=BASE).get("/readyz")
+        assert r.status_code == 503 and r.json()["status"] == "bad-database-encoding" and "UTF8" in r.json()["detail"]
+    finally:
+        core.db.close_pool()
+        with psycopg.connect(admin_dsn, autocommit=True) as c:
+            c.execute(f"DROP DATABASE IF EXISTS {name}")
+
+
+def test_check_encoding_accepts_utf8_and_names_the_problem_otherwise():
+    from identity import core
+
+    class Conn:
+        def __init__(self, value):
+            self.value = value
+
+        def execute(self, _):
+            return self
+
+        def fetchone(self):
+            return {"server_encoding": self.value}
+
+    core.check_encoding(Conn("UTF8"))
+    for value in ("SQL_ASCII", b"SQL_ASCII", "LATIN1"):
+        with pytest.raises(core.DatabaseEncodingError, match="UTF8"):
+            core.check_encoding(Conn(value))
+
+
+def test_the_console_has_no_role_that_nobody_can_hold():
+    from identity import core
+    assert set(core.APP_AUTH.role_permissions) == {"admin"}
