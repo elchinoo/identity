@@ -145,7 +145,8 @@ def test_a_fresh_start_with_only_a_platform_secret_can_sign(env, monkeypatch):
     monkeypatch.setenv("IDENTITY_ENCRYPTION_KEY", "platform-secret-for-the-test-0123456789")
     monkeypatch.setenv("IDENTITY_API_KEY", "static-admin-key-for-the-test-0123456789")
     with TestClient(api.app, base_url=BASE) as client:
-        assert client.get("/readyz").json() == {"status": "ready"}
+        ready = client.get("/readyz").json()
+        assert ready["status"] == "ready" and set(ready["masking"]) == {"last_ok", "drift", "ok"}
         assert client.get("/jwks.json").json()["keys"]
     core.vault.lock()
 

@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import sys
 import time
@@ -6,6 +7,7 @@ from urllib.parse import urlencode
 
 import psycopg
 from apgkit import __version__ as kit_version  # noqa: F401
+from apgkit import masking
 from apgkit import vault as vault_mod
 from apgkit.guard import SecurityGuard
 from apgkit.web import is_https, mount_kit_static, public_url
@@ -16,10 +18,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, apps, audit, core, federation, keys, oauth, users
+from . import __version__, apps, audit, core, federation, hardening, keys, oauth, users
 from .core import COOKIE_ADMIN, COOKIE_SSO, CSRF_HEADER, auth, db, local, login_limiter, metrics, vault
 
 STATIC = Path(__file__).resolve().parent / "static"
+MASKING_EVERY = 300          # seconds between masking re-asserts (agentpg-kit apgkit.masking.reassert_forever)
 _announced = False
 _server: list[oauth.IdentityServer] = []
 
@@ -48,8 +51,14 @@ async def lifespan(_: FastAPI):
         print(f"\n!!! {exc}\n", file=sys.stderr, flush=True)       # /readyz reports it too; do not hide it behind "waking"
     except Exception:  # noqa: BLE001 - the database may be asleep; everything retries on the first request
         pass
-    yield
-    db.close_pool()
+    # Grants made after startup (`agentpg db-users create`, default privileges) reopen base tables, signing_key included: re-assert.
+    reassert = asyncio.create_task(masking.reassert_forever(db.connect, hardening.apply, MASKING_EVERY, deny=hardening.DENY, metrics=metrics))
+    try:
+        yield
+    finally:
+        reassert.cancel()
+        await asyncio.gather(reassert, return_exceptions=True)
+        db.close_pool()
 
 
 app = FastAPI(title="Identity", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -92,7 +101,7 @@ def readyz():
         with db.connect(retries=1) as conn:
             core.check_encoding(conn)
             ready = keys.can_sign(conn)
-        return {"status": "ready"} if ready else JSONResponse({"status": "locked", "detail": "no signing key: unlock the vault"}, status_code=503)
+        return {"status": "ready", "masking": masking.status()} if ready else JSONResponse({"status": "locked", "detail": "no signing key: unlock the vault"}, status_code=503)
     except core.DatabaseEncodingError as exc:
         return JSONResponse({"status": "bad-database-encoding", "detail": str(exc)}, status_code=503)
     except Exception:  # noqa: BLE001

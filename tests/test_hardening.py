@@ -10,9 +10,9 @@ from psycopg.rows import dict_row
 LOGIN = "identity_ro_login"
 
 
-def test_kit_is_at_least_0_3_0():
+def test_kit_is_at_least_0_3_1():
     import apgkit
-    assert tuple(int(x) for x in apgkit.__version__.split(".")[:3]) >= (0, 3, 0)
+    assert tuple(int(x) for x in apgkit.__version__.split(".")[:3]) >= (0, 3, 1)
 
 
 @pytest.fixture
@@ -115,3 +115,28 @@ def test_console_has_a_database_tab_mounting_the_kit_insights():
     from pathlib import Path
     js = (Path(__file__).resolve().parents[1] / "src" / "identity" / "static" / "admin.js").read_text()
     assert 'import { initInsights } from "/kit/insights.js"' in js and 'insights: "Database"' in js and "initInsights($(\"view\"), api)" in js
+
+
+def test_grants_after_startup_are_reasserted(idp, ro):
+    """`agentpg db-users create` / default privileges re-grant SELECT on base tables, signing_key included: one re-assert tick closes them."""
+    from apgkit import masking
+
+    from identity import core, hardening
+    assert {"signing_key", "idp_user"} <= set(hardening.DENY)
+    opened = ["signing_key", "idp_user", "oauth_refresh"]
+    with core.db.connect() as c:
+        for t in opened:
+            c.execute(f'GRANT SELECT ON "{t}" TO a1p_readonly')
+        c.commit()
+        assert sorted(masking.drift(c, hardening.DENY)) == sorted(opened)
+    assert ro.execute("SELECT count(*) AS n FROM signing_key").fetchone()["n"] >= 1            # the hole is real
+    assert masking.reassert_tick(core.db.connect, hardening.apply, deny=hardening.DENY, metrics=core.metrics, name="idp_test") is True
+    st = masking.status("idp_test")
+    assert st["ok"] is True and st["drift"] == len(opened) and st["last_ok"]
+    with core.db.connect() as c:
+        assert masking.drift(c, hardening.DENY) == []
+    for t in opened:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            ro.execute(f'SELECT * FROM "{t}"')
+    assert ro.execute("SELECT count(*) FROM idp_user_masked").fetchone()
+    assert "masking_drift_tables_idp_test" in core.metrics.render()[0].decode()

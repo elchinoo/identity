@@ -37,6 +37,8 @@ DENIED_TABLES = (
     "app_setting",            # kit settings and the vault store (wrapped key, admin password hash)
     "web_session", "api_token", "oidc_login",  # session / API token hashes, PKCE verifiers
 )
+# Every base table the role must never read, masked or not: `masking.reassert_forever` counts (and closes) grants made after startup.
+DENY = tuple(MASKED_VIEWS) + DENIED_TABLES
 
 
 def apply(conn: psycopg.Connection, role: str = ROLE) -> dict[str, object]:

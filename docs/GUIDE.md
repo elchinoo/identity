@@ -520,6 +520,8 @@ the restricted MCP server of `agentpg mcp serve` runs as such a user). Where the
 | `oauth_code`, `oauth_refresh`, `federation_provider`, `app_setting` (admin password hash, vault store), `web_session`, `api_token`, `oidc_login` | `permission denied` |
 | `idp_group`, `idp_membership`, `idp_role_grant`, `idp_audit`, `identity_migrations` | readable (ids, role names, audit text; audit targets contain usernames, so treat the audit trail as internal) |
 
+**Durability.** The hook runs at startup, but grants made later reopen tables: `agentpg db-users create` and AgentPG's default privileges give `a1p_readonly` SELECT on base tables again at any time, including `signing_key`. The app therefore re-asserts every 5 minutes (`masking.reassert_forever` in the lifespan, with `hardening.DENY`: the masked base tables plus every denied table, `signing_key` first). A grant stays readable for up to one interval. Drift shows in the gauge `masking_drift_tables` (alert on `> 0`) and in `masking` of `/readyz` (`last_ok`, `drift`, `ok`); drift never makes `/readyz` fail.
+
 Limits: only the table owner can REVOKE (the hook checks and logs a warning if the revoke did not take); default privileges re-grant
 SELECT on every NEW table, so a table added by a later migration is readable until it is added to `MASKED_VIEWS` or `DENIED_TABLES`
 (a test fails if a column named like a hash, secret, token, password or private key is readable). It does not restrict the app's own owner
