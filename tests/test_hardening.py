@@ -21,7 +21,7 @@ def ro(idp):
     from identity import core, hardening
     with core.db.connect() as c:
         c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='a1p_readonly') THEN CREATE ROLE a1p_readonly NOLOGIN; END IF; END $$")
-        c.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{LOGIN}') THEN CREATE ROLE {LOGIN} LOGIN; END IF; END $$")
+        c.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{LOGIN}') THEN CREATE ROLE {LOGIN} LOGIN PASSWORD 'ro-pw-test'; END IF; END $$")
         c.execute(f"GRANT a1p_readonly TO {LOGIN}")
         c.execute("GRANT USAGE ON SCHEMA public TO a1p_readonly")
         c.execute("GRANT SELECT ON ALL TABLES IN SCHEMA public TO a1p_readonly")
@@ -30,7 +30,7 @@ def ro(idp):
     idp.post("/api/apps", headers=CSRF, json={"client_id": "demo", "name": "Demo", "kind": "web", "redirect_uris": ["https://demo.example.org/cb"], "roles": []})
     from identity import cli
     cli.run_migrations()                                   # the real startup path: the after-migrate hook hardens
-    conn = psycopg.connect(make_conninfo(TEST_URL, user=LOGIN), row_factory=dict_row, autocommit=True)
+    conn = psycopg.connect(make_conninfo(TEST_URL, user=LOGIN, password="ro-pw-test"), row_factory=dict_row, autocommit=True)
     yield conn
     conn.close()
     assert hardening.ROLE == "a1p_readonly"
