@@ -122,7 +122,7 @@ jobs:
           curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
-      - name: Scan the history (config: .gitleaks.toml)
+      - name: Scan the history with .gitleaks.toml
         run: '"$RUNNER_TEMP/gitleaks" git --no-banner --redact -c .gitleaks.toml .'
 
   image-check:
