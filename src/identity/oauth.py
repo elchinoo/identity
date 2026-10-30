@@ -6,7 +6,9 @@ What we add on top of Authlib, and why:
   * Requested scopes must be ones the client is allowed; a service's scopes must all belong to one audience app it may call.
   * Access tokens are short-lived RFC 9068 JWTs (RS256, `kid` in the header) carrying only the roles of the audience app.
   * Refresh tokens are issued only with `offline_access`, rotate on every use, and replaying a used one revokes the whole family.
-  * Authorization codes live 60 seconds and are deleted on use.
+  * Authorization codes live 60 seconds and are consumed atomically: the row is deleted and returned by a single statement, so two
+    concurrent redemptions cannot both succeed.
+  * A refresh token is claimed with a conditional UPDATE (`used_at IS NULL`) before anything is issued; losing that race is treated as reuse.
 """
 import hmac
 import os
@@ -22,7 +24,7 @@ from authlib.oauth2.rfc6749 import (
     OAuth2Error,
     TokenMixin,
 )
-from authlib.oauth2.rfc6749.errors import InvalidRequestError
+from authlib.oauth2.rfc6749.errors import InvalidGrantError, InvalidRequestError
 from authlib.oauth2.rfc6749.grants import AuthorizationCodeGrant, ClientCredentialsGrant, RefreshTokenGrant
 from authlib.oauth2.rfc6749.requests import BasicOAuth2Payload, OAuth2Request
 from authlib.oauth2.rfc6750 import BearerTokenGenerator  # noqa: F401  (documented base of the generator below)
@@ -215,9 +217,11 @@ class CodeGrant(ScopePolicy, AuthorizationCodeGrant):
             conn.commit()
 
     def query_authorization_code(self, code, client):
+        # Consuming the code here (DELETE ... RETURNING) makes redemption single-use even under concurrency: only one caller gets the row.
         with core.db.connect(retries=1) as conn:
-            row = conn.execute("SELECT * FROM oauth_code WHERE code_hash=%s AND client_id=%s AND expires_at > now()",
+            row = conn.execute("DELETE FROM oauth_code WHERE code_hash=%s AND client_id=%s AND expires_at > now() RETURNING *",
                                (sha256(code), client.get_client_id())).fetchone()
+            conn.commit()
         return AuthCode(row) if row else None
 
     def delete_authorization_code(self, authorization_code):
@@ -253,10 +257,22 @@ class RefreshGrant(ScopePolicy, RefreshTokenGrant):
             row = conn.execute("SELECT id, username, email, name, status FROM idp_user WHERE id=%s", (refresh_token.user_id,)).fetchone()
         return User(row, refresh_token.client_id) if row and row["status"] == "active" else None
 
-    def revoke_old_credential(self, refresh_token):
+    def create_token_response(self):
+        """Claim the presented token first: the conditional UPDATE is the single-use gate. A concurrent second request with the same
+        token gets no row back, is treated as reuse, and the whole family is revoked."""
+        record = self.request.refresh_token
         with core.db.connect(retries=1) as conn:
-            conn.execute("UPDATE oauth_refresh SET used_at = now() WHERE id=%s", (refresh_token.row["id"],))
+            claimed = conn.execute("UPDATE oauth_refresh SET used_at = now() WHERE id=%s AND used_at IS NULL AND revoked_at IS NULL RETURNING id",
+                                   (record.row["id"],)).fetchone()
+            if not claimed:
+                conn.execute("UPDATE oauth_refresh SET revoked_at = now() WHERE family_id=%s AND revoked_at IS NULL", (record.family_id,))
             conn.commit()
+        if not claimed:
+            raise InvalidGrantError("Invalid 'refresh_token' in request.")
+        return super().create_token_response()
+
+    def revoke_old_credential(self, refresh_token):
+        """Nothing left to do: create_token_response already marked the token used before issuing its replacement."""
 
 
 class ServiceGrant(ScopePolicy, ClientCredentialsGrant):

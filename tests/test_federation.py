@@ -159,3 +159,35 @@ def test_disabled_or_unconfigured_providers_are_not_offered(idp, monkeypatch):
     assert r.headers["location"].startswith("/login?error=")
     assert TestClient(idp.app, base_url=BASE).get("/login/nope", follow_redirects=False).headers["location"].startswith("/login?error=")
     assert json.loads(json.dumps(idp.get("/api/federation").json()))["available"] == {"google": "Google", "github": "GitHub"}
+
+
+def test_state_is_bound_to_the_browser_that_started_the_login(idp, monkeypatch):
+    w, up = setup(idp, monkeypatch)
+    victim_start = TestClient(idp.app, base_url=BASE).get("/login/google", follow_redirects=False)
+    cookie = victim_start.headers["set-cookie"].lower()
+    assert "idp_fed=" in cookie and "httponly" in cookie and "samesite=lax" in cookie and "max-age=600" in cookie and "path=/login" in cookie
+    attacker = TestClient(idp.app, base_url=BASE)
+    start = attacker.get("/login/google", follow_redirects=False)
+    q = parse_qs(urlsplit(start.headers["location"]).query)
+    up.last_nonce = q["nonce"][0]
+    # the attacker's state delivered to a different browser (no cookie, or somebody else's cookie) is refused and never signs in
+    other = TestClient(idp.app, base_url=BASE)
+    r = other.get("/login/google/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
+    assert r.headers["location"].startswith("/login?error=") and "idp_sso" not in r.cookies
+    other.get("/login/google", follow_redirects=False)                                    # now with a cookie, but for another state
+    r = other.get("/login/google/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
+    assert r.headers["location"].startswith("/login?error=") and "idp_sso" not in r.cookies
+    # the genuine browser still completes, and the cookie is single use
+    r = attacker.get("/login/google/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/" and "idp_sso" in r.cookies
+    assert "idp_fed" not in attacker.cookies
+    again = attacker.get("/login/google/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
+    assert again.headers["location"].startswith("/login?error=")
+
+
+def test_forwarded_allow_ips_is_never_a_wildcard_by_default(monkeypatch):
+    from identity import cli
+    monkeypatch.delenv("IDENTITY_FORWARDED_ALLOW_IPS", raising=False)
+    assert cli.forwarded_allow_ips() == "127.0.0.1"
+    monkeypatch.setenv("IDENTITY_FORWARDED_ALLOW_IPS", "10.1.2.3")
+    assert cli.forwarded_allow_ips() == "10.1.2.3"

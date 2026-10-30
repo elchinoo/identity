@@ -170,7 +170,7 @@ How the pieces work, by module:
 | `static/` | Sign-in page, launcher, admin console (plain JS, no inline script) and the shared `/kit/` UI |
 
 Lifecycle of a start (`identity start`): apply SQL migrations (the kit's shared tables, then `001_init.sql`, recorded in
-`identity_migrations`), then serve with `uvicorn` (`proxy_headers=True`, `forwarded_allow_ips="*"`). During the application start-up
+`identity_migrations`), then serve with `uvicorn` (`proxy_headers=True`, `forwarded_allow_ips` taken from `IDENTITY_FORWARDED_ALLOW_IPS`, default `127.0.0.1`: behind a reverse proxy set it to that proxy's address, AgentPG's single proxy included; never `*`). During the application start-up
 it tries to unlock the vault with the platform secret, creates the vault from the platform secret alone if none exists and a platform
 secret is set, makes sure an active signing key exists (needs the vault unlocked), and prints the one-time setup code if no admin
 exists yet. Any failure there (for example a sleeping database) is swallowed; everything retries on the first request.

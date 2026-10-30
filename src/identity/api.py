@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hmac
 import sys
 import time
 from pathlib import Path
@@ -193,6 +194,10 @@ def login(body: LoginBody, request: Request, response: Response):
     return {"next": core.safe_next(body.next)}
 
 
+COOKIE_FED = "idp_fed"                  # binds an upstream sign-in attempt to the browser that started it
+FED_COOKIE_PATH = "/login"
+
+
 @app.get("/login/{provider}")
 def login_upstream(provider: str, request: Request, next: str | None = None):
     try:
@@ -200,13 +205,26 @@ def login_upstream(provider: str, request: Request, next: str | None = None):
             url = federation.begin(conn, provider, public_url(request, "IDENTITY_PUBLIC_URL"), next)
     except federation.FederationError as exc:
         return RedirectResponse(f"/login?{urlencode({'error': str(exc)})}", status_code=303)
-    return RedirectResponse(url, status_code=303)
+    resp = RedirectResponse(url, status_code=303)
+    resp.set_cookie(COOKIE_FED, federation.state_of(url), httponly=True, samesite="lax", secure=is_https(request),
+                    max_age=federation.STATE_MINUTES * 60, path=FED_COOKIE_PATH)
+    return resp
+
+
+def _fed_failed(message: str) -> RedirectResponse:
+    resp = RedirectResponse(f"/login?{urlencode({'error': message})}", status_code=303)
+    resp.delete_cookie(COOKIE_FED, path=FED_COOKIE_PATH)
+    return resp
 
 
 @app.get("/login/{provider}/callback")
 def login_upstream_callback(provider: str, request: Request, code: str = "", state: str = "", error: str = ""):
     if error or not code or not state:
-        return RedirectResponse(f"/login?{urlencode({'error': 'the sign-in was cancelled or failed'})}", status_code=303)
+        return _fed_failed("the sign-in was cancelled or failed")
+    # the state must come back in the browser that began the attempt (login CSRF); compared in constant time, and the cookie is single use
+    bound = request.cookies.get(COOKIE_FED, "")
+    if not bound or not hmac.compare_digest(bound.encode(), state.encode()):
+        return _fed_failed("the sign-in attempt does not belong to this browser; start again")
     try:
         with db.connect(retries=1) as conn:
             user, back = federation.finish(conn, provider, public_url(request, "IDENTITY_PUBLIC_URL"), code, state)
@@ -214,9 +232,10 @@ def login_upstream_callback(provider: str, request: Request, code: str = "", sta
             start_sso(conn, request, resp, user)
             audit.log(conn, user["username"], "login_federated", provider)
             conn.commit()
+            resp.delete_cookie(COOKIE_FED, path=FED_COOKIE_PATH)
             return resp
     except federation.FederationError as exc:
-        return RedirectResponse(f"/login?{urlencode({'error': str(exc)})}", status_code=303)
+        return _fed_failed(str(exc))
 
 
 @app.post("/logout")

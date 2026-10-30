@@ -16,11 +16,18 @@ def run_migrations() -> list[str]:
     return kit_migrate.run(core.db, core.MIGRATIONS, table="identity_migrations", after_migrate=[hardening.apply])
 
 
+def forwarded_allow_ips() -> str:
+    """Peers whose X-Forwarded-* headers are believed (comma-separated addresses or networks). Default: loopback only, so a caller cannot
+    choose the address the login limiter sees. Behind a reverse proxy, set IDENTITY_FORWARDED_ALLOW_IPS to that proxy's address
+    (AgentPG puts a single proxy in front of the app; use its address, never '*')."""
+    return os.environ.get("IDENTITY_FORWARDED_ALLOW_IPS", "").strip() or "127.0.0.1"
+
+
 def _serve() -> None:
     import uvicorn
 
     uvicorn.run("identity.api:app", host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "8000")),
-                proxy_headers=True, forwarded_allow_ips="*")
+                proxy_headers=True, forwarded_allow_ips=forwarded_allow_ips())
 
 
 def _rotate_keys(args) -> int:

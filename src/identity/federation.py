@@ -95,13 +95,18 @@ def _callback(base_url: str, provider: str) -> str:
     return f"{base_url}/login/{provider}/callback"
 
 
+def state_of(authorize_url: str) -> str:
+    """The `state` parameter of an upstream authorization URL (the caller ties it to the browser with a cookie)."""
+    return parse_qs(urlsplit(authorize_url).query)["state"][0]
+
+
 def begin(conn, provider: str, base_url: str, next_url: str | None) -> str:
     cfg = _config(conn, provider)
     redirect_uri = _callback(base_url, provider)
     if provider == "google":
         rp = RelyingParty(GOOGLE_ISSUER, cfg["client_id"], lambda: core.vault.decrypt(cfg["client_secret_enc"]), http=http_factory, scopes="openid email profile")
         url = rp.begin(conn, redirect_uri, next_url)
-        state = parse_qs(urlsplit(url).query)["state"][0]
+        state = state_of(url)
         conn.execute("UPDATE oidc_login SET return_to=%s WHERE state=%s", (core.safe_next(next_url), state))   # the kit keeps only 300 characters
         conn.commit()
         return url
