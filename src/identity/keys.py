@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from joserfc.jwk import RSAKey
 from psycopg.types.json import Jsonb
 
-from . import core
+from . import audit, core
 from .ids import new_kid
 
 RETIRE_AFTER = timedelta(hours=24)
@@ -47,6 +47,30 @@ def rotate(conn, first: bool = False) -> str:
     with _lock:
         _cache.update(kid=None, key=None, at=0.0)
     return kid
+
+
+def emergency_rotate(conn, actor: str = "cli", reason: str = "") -> dict:
+    """Hard revoke: a new key becomes active and EVERY earlier key is deleted at once (private half included), so the JWKS lists
+    only the new key from this moment. Unlike `rotate`, nothing stays valid for a retire window: tokens signed by any earlier key
+    fail verification as soon as a verifier refreshes its JWKS (the kit's TokenVerifier caches it for at most its `ttl`, 5 minutes by
+    default), and every refresh token is revoked and every browser SSO session ended, so people sign in again. The local operator
+    sessions (the admin console) are kept so the operator who runs this is not locked out. One transaction, audited."""
+    kid = new_kid()
+    key = _generate(kid)
+    old = [r["kid"] for r in conn.execute("SELECT kid FROM signing_key").fetchall()]
+    conn.execute("DELETE FROM signing_key")
+    conn.execute("INSERT INTO signing_key (kid, alg, private_enc, public_jwk) VALUES (%s,'RS256',%s,%s)",
+                 (kid, core.vault.encrypt(key.as_pem(private=True).decode()), Jsonb(key.as_dict(private=False))))
+    refresh = conn.execute("UPDATE oauth_refresh SET revoked_at = now() WHERE revoked_at IS NULL").rowcount
+    codes = conn.execute("DELETE FROM oauth_code").rowcount
+    sessions = conn.execute("DELETE FROM web_session WHERE source <> 'local'").rowcount
+    detail = {"removed_keys": old, "refresh_tokens_revoked": refresh, "sso_sessions_ended": sessions, "codes_dropped": codes}
+    if reason:
+        detail["reason"] = reason[:200]
+    audit.log(conn, actor, "signing_key_emergency_rotated", kid, **detail)
+    conn.commit()
+    forget()
+    return {"kid": kid, **detail}
 
 
 def signing_key(conn) -> RSAKey:

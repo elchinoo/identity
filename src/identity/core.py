@@ -4,7 +4,8 @@ from pathlib import Path
 
 from apgkit import metrics as metrics_mod
 from apgkit.auth import AppAuth, Authenticator, LocalAuth
-from apgkit.config import env_bool
+from apgkit.auth.principal import WILDCARD, Principal
+from apgkit.config import env_bool, read_secret
 from apgkit.db import Database
 from apgkit.ratelimit import FailureLimiter
 from apgkit.vault import Vault
@@ -37,7 +38,17 @@ login_limiter = FailureLimiter(window=300, limit=10)        # sign-in failures p
 APP_AUTH = AppAuth(APP, APP, role_permissions={"admin": frozenset({"*"})},
                    scope_permissions={"full": frozenset({"*"}), "read": frozenset({"admin:read"}), "metrics": frozenset({"metrics:scrape"})})
 local = LocalAuth(APP_AUTH, env_prefix="IDENTITY", token_prefix="idt_", token_scopes={"read", "metrics", "full"}, vault=vault)
-auth = Authenticator(APP_AUTH, local, db, cookie_name=COOKIE_ADMIN, allow_anonymous=env_bool("IDENTITY_ALLOW_ANONYMOUS"))
+
+# Static credentials besides IDENTITY_API_KEY (the wildcard admin key), each read from env or <NAME>_FILE on every request and
+# compared in constant time by the kit:
+#  * IDENTITY_API_KEY_NEXT: a second wildcard admin key, accepted alongside IDENTITY_API_KEY so the admin key can be rotated with no
+#    window in which automation is locked out (set NEXT, restart, switch callers, promote NEXT to IDENTITY_API_KEY, drop NEXT).
+#  * IDENTITY_DEPLOY_KEY: a narrow credential for deploy tooling. It can read, register and update apps, create groups and make grants
+#    (DEPLOY_PERMISSIONS); it cannot reset a client secret, delete anything, create users, rotate keys or touch federation.
+DEPLOY_PERMISSIONS = frozenset({"admin:read", "apps:write", "groups:write", "grants:write"})
+auth = Authenticator(APP_AUTH, local, db, cookie_name=COOKIE_ADMIN, allow_anonymous=env_bool("IDENTITY_ALLOW_ANONYMOUS"),
+                     static_tokens=[(lambda: read_secret("IDENTITY_API_KEY_NEXT"), Principal("static", "static-key-next", frozenset({WILDCARD}), name="api key (next)")),
+                                    (lambda: read_secret("IDENTITY_DEPLOY_KEY"), Principal("static", "deploy-key", DEPLOY_PERMISSIONS, name="deploy key"))])
 
 
 class DatabaseEncodingError(RuntimeError):

@@ -280,6 +280,9 @@ Verified in `core.py`, `api.py`, `cli.py`, the kit (`config.py`, `vault.py`, `au
 | `IDENTITY_ENCRYPTION_KEY_FILE` | `/etc/identity/encryption_key` | The same secret as a file (first line). Used only when the variable above is empty. |
 | `IDENTITY_API_KEY` | none | Optional static full-access key for automation (`Authorization: Bearer <key>` on `/api/*`, or the "Use the server's API key instead" sign-in in the console). While it is set and no admin password exists, **the setup-code flow is off** (`needs_setup` is false). |
 | `IDENTITY_API_KEY_FILE` | `/etc/identity/api_key` | The same key as a file. |
+| `IDENTITY_API_KEY_NEXT` / `_FILE` | none | A **second full-access key**, accepted alongside `IDENTITY_API_KEY`. Rotating the admin key without data loss or a lockout: (1) set `IDENTITY_API_KEY_NEXT` to the new value and restart; (2) move every caller (ecoctl state, CI) to the new key; (3) set `IDENTITY_API_KEY` to the new value, remove `IDENTITY_API_KEY_NEXT`, restart. Nothing is stored in the database, so nothing is lost. Keys are read from the environment or the file on each request and compared in constant time. |
+| `IDENTITY_DEPLOY_KEY` / `_FILE` | none | A **narrow credential for deploy tooling**. It holds `admin:read`, `apps:write`, `groups:write`, `grants:write`: list/read everything, register and update apps, create groups, make grants. It is refused (403) for: resetting a client secret, deleting apps, groups or grants, creating or changing users and passwords, signing-key rotation (graceful or emergency), federation, operator tokens and database insights. Those need the admin key, the admin password session or a `full` token. It is not a sandbox: it can change an app's redirect URIs and grant roles to existing users and groups, so keep it as secret as the admin key, just with a smaller blast radius. Today ecoctl and the Ansible recipe still use the admin key (they reset client secrets when re-registering an app); moving them to this key is a follow-up. |
+| `IDENTITY_REFRESH_TTL_DAYS` | `30` | Lifetime of refresh tokens issued from now on (1 to 365; anything else is ignored and the default applies). Tokens already issued keep their stored expiry. |
 | `IDENTITY_ALLOW_ANONYMOUS` | `false` | If true, every request to a protected route is treated as an administrator with full access. Never set this outside a throwaway test. |
 | `HOST` | `0.0.0.0` | Bind address of `identity serve|start`. |
 | `PORT` | `8000` | Bind port. The image's `HEALTHCHECK` reads `PORT`, so keep it set (the image sets it). |
@@ -299,8 +302,8 @@ These are constants, not settings.
 | Authorization code lifetime | `oauth.CODE_TTL` | 60 seconds, single use |
 | Access token lifetime | `oauth.ACCESS_TTL` | 600 seconds, RS256 JWT, `typ: at+jwt` |
 | ID token lifetime | `oauth.ID_TTL` | 600 seconds |
-| Refresh token lifetime | `oauth.REFRESH_TTL` | 30 days, rotated on every use |
-| Signing key | `keys.py` | RSA 2048, RS256; a rotated key stays published 24 hours (`RETIRE_AFTER`) |
+| Refresh token lifetime | `oauth.refresh_ttl()` | 30 days by default (`IDENTITY_REFRESH_TTL_DAYS`), rotated on every use |
+| Signing key | `keys.py` | RSA 2048, RS256; a rotated key stays published 24 hours (`RETIRE_AFTER`); an emergency rotation removes old keys at once (below) |
 | JWKS cache hint | `/jwks.json` | `Cache-Control: public, max-age=300` |
 | Person (SSO) session | `start_sso` | 12 hours, cookie `idp_sso`, `HttpOnly`, `SameSite=Lax`, `Secure` over https |
 | Admin session | `_admin_session` | 12 hours, cookie `idp_admin`, `HttpOnly`, `SameSite=Strict`, `Secure` over https |
@@ -479,7 +482,7 @@ unlocked, otherwise `423`); the old key becomes `retiring` and stays published f
 Every change writes a row in `idp_audit` in the same transaction: actor, action, target, detail. Actions seen in code: `login_failed`,
 `login_federated`, `authorize`, `user_created`, `user_updated`, `password_reset`, `user_deleted`, `group_created`, `group_deleted`,
 `group_member_added`, `group_member_removed`, `app_registered`, `app_updated`, `app_secret_rotated`, `app_deleted`, `role_granted`,
-`role_revoked`, `signing_key_rotated`, `federation_configured`, `federation_removed`. The API returns the latest 1 to 500 rows
+`role_revoked`, `signing_key_rotated`, `signing_key_emergency_rotated`, `federation_configured`, `federation_removed`. The API returns the latest 1 to 500 rows
 (default 200). Operator-token actions are logged under the token's name, the admin password session as `admin`, the static key as `api key`.
 
 ### 7.8 Settings (console: Settings)
@@ -804,3 +807,23 @@ Found while writing this guide (from code reading unless noted; several earlier 
 * Not exercised for this guide: the live Google and GitHub round trip, `ecoctl apply` against AgentPG, multi-replica behaviour, and
   running the container image (Docker was not available). The local flow (setup, seed, app registration, code flow with PKCE through a
   small relying party, `client_credentials`, `/metrics`, the test suite) was run against a throwaway local Postgres.
+
+## Emergency key rotation
+
+Use it when a signing key may have been exposed, or someone could have written to the `signing_key` table. The graceful rotation
+(console **Rotate key**, `POST /api/keys/rotate`, `identity rotate-keys`) keeps the old key published for 24 hours so nothing breaks;
+the emergency one does not wait.
+
+* API: `POST /api/keys/emergency-rotate` with `{"confirm": true, "reason": "..."}` (full admin only; the deploy key and `read` tokens get 403).
+* CLI, on the host or in the container, with `DATABASE_URL` and `IDENTITY_ENCRYPTION_KEY` (or `_FILE`) set: `identity rotate-keys --emergency --yes --reason "..."`.
+  Without `--emergency` the same command does the graceful rotation.
+
+In one transaction it: creates a new active key; **deletes every earlier key** (private half included), so `/jwks.json` lists only the new
+key at once; revokes every refresh token; drops pending authorization codes; ends every SSO (person) session; keeps the operator
+(admin console) sessions; writes a `signing_key_emergency_rotated` audit row listing the removed kids and the counts.
+
+What bites when: Identity itself (userinfo, introspection, logout hints) refuses old access tokens immediately. Other Identity replicas
+follow within 30 seconds. An app verifier trusts the JWKS it fetched for at most `<PREFIX>_OIDC_JWKS_TTL` (5 minutes by default, capped at one hour; the kit release after 0.3.1), so old tokens stop working there within
+that time; `/jwks.json` also carries `Cache-Control: max-age=300`, so budget up to about ten minutes in the worst case with any shared cache in front. Sessions
+that apps keep in their own databases (`web_session`) are not touched by Identity; they end by expiry (12 hours) or by clearing that table in the app.
+People sign in again; services refetch tokens on their own. Rotate the admin key (`IDENTITY_API_KEY_NEXT`) and client secrets too if they may be exposed.

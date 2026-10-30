@@ -22,6 +22,6 @@ Report vulnerabilities privately (GitHub: Security tab, "Report a vulnerability"
 
 Grants made after startup (`agentpg db-users create`, default privileges) reopen tables to the read-only database role, `signing_key` included; the app re-asserts the REVOKEs every 5 minutes (gauge `masking_drift_tables`, `masking` in `/readyz`), so a table can be readable for up to one interval.
 
-Rate limits and sessions are per process. Access tokens cannot be revoked before they expire. One signing algorithm (RS256).
+Rate limits and sessions are per process. Access tokens cannot be revoked before they expire, but an emergency key rotation (`identity rotate-keys --emergency --yes`, or `POST /api/keys/emergency-rotate`) makes every token signed by an earlier key unverifiable once the apps' JWKS cache (5 minutes by default) refreshes, and revokes all refresh tokens and SSO sessions. One signing algorithm (RS256).
 There is no MFA. Treat the identity provider as the most sensitive service in the fleet: restrict the admin console,
 back up the database, and keep `IDENTITY_ENCRYPTION_KEY` out of the database host.

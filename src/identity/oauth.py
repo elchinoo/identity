@@ -9,6 +9,7 @@ What we add on top of Authlib, and why:
   * Authorization codes live 60 seconds and are deleted on use.
 """
 import hmac
+import os
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
@@ -37,10 +38,20 @@ from .apps import STANDARD_SCOPES
 
 ACCESS_TTL = 600            # seconds: short, so a disabled user or revoked role bites quickly
 ID_TTL = 600
-REFRESH_TTL = 30 * 86400
+REFRESH_TTL = 30 * 86400    # the default; IDENTITY_REFRESH_TTL_DAYS overrides it (read when a refresh token is issued, see refresh_ttl)
 CODE_TTL = 60
 USER_GRANTS = {"authorization_code", "refresh_token"}
 SERVICE_GRANTS = {"client_credentials"}
+
+
+def refresh_ttl() -> int:
+    """Seconds a refresh token lives: IDENTITY_REFRESH_TTL_DAYS (1 to 365; a bad value is ignored), else the 30-day default.
+    Applies to tokens issued after the change; tokens already issued keep the expiry they were stored with."""
+    try:
+        days = float(os.environ.get("IDENTITY_REFRESH_TTL_DAYS", ""))
+    except ValueError:
+        return REFRESH_TTL
+    return int(days * 86400) if 1 <= days <= 365 else REFRESH_TTL
 
 
 class Client(ClientMixin):
@@ -397,7 +408,7 @@ class IdentityServer(AuthorizationServer):
         with core.db.connect(retries=1) as conn:
             conn.execute("INSERT INTO oauth_refresh (token_hash, family_id, client_id, user_id, scope, auth_time, expires_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
                          (sha256(token["refresh_token"]), family, request.client.get_client_id(), user.get_user_id(), token.get("scope", ""),
-                          auth_time, datetime.now(UTC) + timedelta(seconds=REFRESH_TTL)))
+                          auth_time, datetime.now(UTC) + timedelta(seconds=refresh_ttl())))
             conn.commit()
 
     def create_oauth2_request(self, request):

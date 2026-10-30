@@ -74,6 +74,11 @@ class GrantBody(_Body):
     role: str = Field(max_length=40)
 
 
+class EmergencyBody(_Body):
+    confirm: bool = False
+    reason: str = Field("", max_length=200)
+
+
 class ProviderBody(_Body):
     client_id: str = Field(max_length=300)
     client_secret: str | None = Field(None, max_length=500)
@@ -96,6 +101,9 @@ def _errors():
 def build_router(auth, keys_forget) -> APIRouter:
     r = APIRouter(prefix="/api")
     write, read = Depends(auth.require("*")), Depends(auth.require("admin:read"))
+    # What deploy tooling needs (register/update apps, groups, grants) has its own permissions, so a narrow credential (IDENTITY_DEPLOY_KEY)
+    # can do just that; everything destructive or sensitive stays on "*" (the admin key, the admin password, a `full` token).
+    apps_w, groups_w, grants_w = Depends(auth.require("apps:write")), Depends(auth.require("groups:write")), Depends(auth.require("grants:write"))
 
     def actor(p) -> str:
         return p.actor
@@ -188,7 +196,7 @@ def build_router(auth, keys_forget) -> APIRouter:
             return users.groups(conn)
 
     @r.post("/groups", status_code=201)
-    def create_group(body: GroupBody, p=write):
+    def create_group(body: GroupBody, p=groups_w):
         with _errors(), db.connect() as conn:
             g = users.create_group(conn, body.name, body.description)
             audit.log(conn, actor(p), "group_created", g["name"])
@@ -210,7 +218,7 @@ def build_router(auth, keys_forget) -> APIRouter:
             return apps.listing(conn)
 
     @r.post("/apps", status_code=201)
-    def register_app(body: AppBody, p=write):
+    def register_app(body: AppBody, p=apps_w):
         d = body.model_dump()
         with _errors(), db.connect() as conn:
             app, secret = apps.register(conn, d.pop("client_id"), d.pop("name"), d.pop("kind"), d)
@@ -224,7 +232,7 @@ def build_router(auth, keys_forget) -> APIRouter:
             return {**apps.get(conn, client_id), "grants": users.grants(conn, client_id)}
 
     @r.patch("/apps/{client_id}")
-    def patch_app(client_id: str, body: AppPatch, p=write):
+    def patch_app(client_id: str, body: AppPatch, p=apps_w):
         with _errors(), db.connect() as conn:
             app = apps.update(conn, client_id, body.model_dump(exclude_unset=True))
             audit.log(conn, actor(p), "app_updated", client_id, fields=sorted(body.model_dump(exclude_unset=True)))
@@ -254,7 +262,7 @@ def build_router(auth, keys_forget) -> APIRouter:
             return users.grants(conn, client_id)
 
     @r.post("/grants", status_code=201)
-    def grant(body: GrantBody, p=write):
+    def grant(body: GrantBody, p=grants_w):
         with _errors(), db.connect() as conn:
             users.grant_role(conn, body.subject_type, body.subject, body.client_id, body.role)
             audit.log(conn, actor(p), "role_granted", f"{body.client_id}:{body.role}", subject=f"{body.subject_type}:{body.subject}")
@@ -286,6 +294,18 @@ def build_router(auth, keys_forget) -> APIRouter:
             conn.commit()
         keys_forget()
         return {"kid": kid}
+
+    @r.post("/keys/emergency-rotate")
+    def emergency_rotate_keys(body: EmergencyBody, p=write):
+        """Hard revoke: new key, every old key out of the JWKS at once, every refresh token revoked, SSO sessions ended. Full admin only."""
+        if not body.confirm:
+            raise HTTPException(422, 'this removes every old signing key at once and signs everyone out: send {"confirm": true}')
+        if not vault.is_unlocked():
+            raise HTTPException(423, "unlock the vault first")
+        with db.connect() as conn:
+            out = keys.emergency_rotate(conn, actor(p), body.reason)
+        keys_forget()
+        return out
 
     # ---- federation ----
     @r.get("/federation", dependencies=[read])

@@ -13,7 +13,9 @@ The identity provider of the AgentPG ecosystem. One sign-in for every app, one p
 - **Service identities**: apps and jobs get tokens with `client_credentials` instead of hand-copied secrets, scoped to
   one audience app at a time.
 - **Signing keys** are generated here (RS256), stored encrypted under the vault, rotated from the console (the old key
-  stays published for 24 hours), and published as a JWKS that apps verify against locally.
+  stays published for 24 hours), and published as a JWKS that apps verify against locally. An **emergency rotation**
+  (console API `POST /api/keys/emergency-rotate`, or `identity rotate-keys --emergency --yes`) removes every old key at once and
+  revokes all refresh tokens and SSO sessions.
 - Built from [`agentpg-kit`](https://github.com/elchinoo/agentpg-kit) blocks: config, Postgres, vault, security middleware,
   metrics, local admin, and the same OIDC pieces every app uses to log in. An audit trail records every change.
 
@@ -50,6 +52,9 @@ such as `trustdesk`. Scopes address one audience app by their prefix.
 | `IDENTITY_PUBLIC_URL`, `IDENTITY_ISSUER` | The URL the provider is reached at; it becomes the token issuer, so set it once and keep it. Default: the first request's address. |
 | `IDENTITY_ENCRYPTION_KEY[_FILE]` | Platform secret that unlocks the vault (signing keys, provider secrets) at startup. |
 | `IDENTITY_API_KEY[_FILE]` | Optional static full-access key for automation. |
+| `IDENTITY_API_KEY_NEXT[_FILE]` | A second full-access key accepted alongside the first, to rotate the admin key without a lockout. |
+| `IDENTITY_DEPLOY_KEY[_FILE]` | Optional narrow key for deploy tooling: read, register/update apps, create groups, make grants. Nothing destructive. |
+| `IDENTITY_REFRESH_TTL_DAYS` | Refresh token lifetime, 1 to 365 days (default 30). |
 
 ## Documentation
 

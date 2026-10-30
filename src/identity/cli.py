@@ -5,7 +5,7 @@ import sys
 from apgkit import migrate as kit_migrate
 from apgkit.auth.schema import SQL as AUTH_SQL
 
-from . import core, hardening
+from . import audit, core, hardening, keys
 
 
 def run_migrations() -> list[str]:
@@ -23,12 +23,39 @@ def _serve() -> None:
                 proxy_headers=True, forwarded_allow_ips="*")
 
 
+def _rotate_keys(args) -> int:
+    """Needs the vault unlocked, which for the CLI means IDENTITY_ENCRYPTION_KEY (or its _FILE) is set in this process's environment."""
+    if args.emergency and not args.yes:
+        print("refusing: --emergency removes every old signing key at once and signs everyone out; add --yes to proceed", file=sys.stderr)
+        return 2
+    with core.db.connect() as conn:
+        core.vault.try_unlock_with_platform_secret(conn)
+        if not core.vault.is_unlocked():
+            print("the vault is locked: set IDENTITY_ENCRYPTION_KEY (or IDENTITY_ENCRYPTION_KEY_FILE) for this command", file=sys.stderr)
+            return 1
+        if args.emergency:
+            out = keys.emergency_rotate(conn, "cli", args.reason)
+            print(f"emergency rotation done: new key {out['kid']}; removed {len(out['removed_keys'])} key(s), revoked {out['refresh_tokens_revoked']} "
+                  f"refresh token(s), ended {out['sso_sessions_ended']} SSO session(s). Apps stop accepting old tokens once their JWKS cache "
+                  "refreshes (5 minutes by default); other identity replicas notice within 30 seconds.")
+        else:
+            kid = keys.rotate(conn)
+            audit.log(conn, "cli", "signing_key_rotated", kid)
+            conn.commit()
+            print(f"rotated: new key {kid}; the old key stays published for 24 hours")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="identity")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("migrate", help="apply SQL migrations")
     sub.add_parser("serve", help="run the identity provider")
     sub.add_parser("start", help="container entrypoint: migrate, then serve")
+    rk = sub.add_parser("rotate-keys", help="rotate the signing key: graceful by default (the old key stays published 24 h); --emergency hard-revokes")
+    rk.add_argument("--emergency", action="store_true", help="remove every old key from the JWKS at once, revoke all refresh tokens, end SSO sessions")
+    rk.add_argument("--yes", action="store_true", help="required with --emergency")
+    rk.add_argument("--reason", default="", help="recorded in the audit log")
     sub.add_parser("reset-admin", help="forget the admin password and vault (recovery)")
     args = p.parse_args(argv)
     if args.cmd == "migrate":
@@ -52,6 +79,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print("migrations applied:", ", ".join(applied) if applied else "none (up to date)")
         _serve()
+    elif args.cmd == "rotate-keys":
+        return _rotate_keys(args)
     elif args.cmd == "reset-admin":
         with core.db.connect() as conn:
             core.local.reset_admin(conn)
