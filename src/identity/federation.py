@@ -8,6 +8,9 @@ Mapping rules, strictest first:
   4. Otherwise: refused. The default mode is `invite_only`: an administrator creates the user first.
 A disabled user is refused whatever the provider says.
 """
+import base64
+import hashlib
+import hmac
 import re
 import secrets
 from collections.abc import Callable
@@ -15,7 +18,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 from apgkit.auth.oidc import TokenError, _client_factory
-from apgkit.auth.rp import RelyingParty
+from apgkit.auth.rp import LoginStart, RelyingParty
 from psycopg.types.json import Jsonb  # noqa: F401  (kept for providers that later store raw profiles)
 
 from . import core, users
@@ -64,7 +67,7 @@ def upsert_provider(conn, provider: str, client_id: str, client_secret: str | No
     if client_secret:
         if not core.vault.is_initialized(conn):
             raise FederationError("set an admin password first: the provider secret is stored encrypted under it")
-        enc = core.vault.encrypt(client_secret.strip())
+        enc = core.vault.encrypt(client_secret.strip(), core.CTX_PROVIDER_SECRET.format(provider=provider))
     elif existing:
         enc = existing["client_secret_enc"]
     else:
@@ -96,39 +99,62 @@ def _callback(base_url: str, provider: str) -> str:
 
 
 def state_of(authorize_url: str) -> str:
-    """The `state` parameter of an upstream authorization URL (the caller ties it to the browser with a cookie)."""
+    """The `state` parameter of an upstream authorization URL."""
     return parse_qs(urlsplit(authorize_url).query)["state"][0]
 
 
-def begin(conn, provider: str, base_url: str, next_url: str | None) -> str:
+def _secret(conn, cfg: dict) -> str:
+    """The provider's client secret, opened under its row's context. A value written before contexts existed is bound to its row now."""
+    ctx = core.CTX_PROVIDER_SECRET.format(provider=cfg["provider"])
+    plain = core.vault.decrypt(cfg["client_secret_enc"], ctx)
+    if core.vault.is_legacy(cfg["client_secret_enc"]):
+        conn.execute("UPDATE federation_provider SET client_secret_enc=%s WHERE provider=%s AND client_secret_enc=%s",
+                     (core.vault.encrypt(plain, ctx), cfg["provider"], cfg["client_secret_enc"]))
+        conn.commit()
+    return plain
+
+
+def _google(conn, cfg: dict) -> RelyingParty:
+    return RelyingParty(GOOGLE_ISSUER, cfg["client_id"], lambda: _secret(conn, cfg), http=http_factory, scopes="openid email profile")
+
+
+def begin(conn, provider: str, base_url: str, next_url: str | None) -> LoginStart:
+    """Start an upstream sign-in. The caller redirects to `.url` and calls `.bind(response)`: the browser-binding cookie ties the
+    attempt to the browser that started it (the kit's mechanism, used for Google and GitHub alike)."""
     cfg = _config(conn, provider)
     redirect_uri = _callback(base_url, provider)
     if provider == "google":
-        rp = RelyingParty(GOOGLE_ISSUER, cfg["client_id"], lambda: core.vault.decrypt(cfg["client_secret_enc"]), http=http_factory, scopes="openid email profile")
-        url = rp.begin(conn, redirect_uri, next_url)
-        state = state_of(url)
-        conn.execute("UPDATE oidc_login SET return_to=%s WHERE state=%s", (core.safe_next(next_url), state))   # the kit keeps only 300 characters
+        login = _google(conn, cfg).start(conn, redirect_uri, next_url)
+        conn.execute("UPDATE oidc_login SET return_to=%s WHERE state=%s", (core.safe_next(next_url), state_of(login.url)))   # the kit keeps only 300 characters
         conn.commit()
-        return url
-    state, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(48)
-    import base64
-    import hashlib
+        return login
+    state, verifier, nonce = secrets.token_urlsafe(24), secrets.token_urlsafe(48), secrets.token_urlsafe(16)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    binding = _binding(state, nonce)
     conn.execute("DELETE FROM oidc_login WHERE created_at < now() - %s * interval '1 minute'", (STATE_MINUTES,))
-    conn.execute("INSERT INTO oidc_login (state, verifier, nonce, return_to) VALUES (%s,%s,'-',%s)", (state, verifier, core.safe_next(next_url)))
+    conn.execute("INSERT INTO oidc_login (state, verifier, nonce, return_to, binding_hash) VALUES (%s,%s,%s,%s,%s)",
+                 (state, verifier, nonce, core.safe_next(next_url), binding))
     conn.commit()
-    return f"{GITHUB_AUTHORIZE}?" + urlencode({"client_id": cfg["client_id"], "redirect_uri": redirect_uri, "scope": "read:user user:email",
+    url = f"{GITHUB_AUTHORIZE}?" + urlencode({"client_id": cfg["client_id"], "redirect_uri": redirect_uri, "scope": "read:user user:email",
                                               "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
+    return LoginStart(url, binding)
 
 
-def _github_identity(conn, cfg: dict, redirect_uri: str, code: str, state: str) -> tuple[dict, str]:
-    row = conn.execute("DELETE FROM oidc_login WHERE state=%s AND created_at > now() - %s * interval '1 minute' RETURNING verifier, return_to",
+def _binding(state: str, nonce: str) -> str:
+    return hashlib.sha256(f"{state}.{nonce}".encode()).hexdigest()       # the same value the kit's relying party stores
+
+
+def _github_identity(conn, cfg: dict, redirect_uri: str, code: str, state: str, binding: str | None) -> tuple[dict, str]:
+    row = conn.execute("DELETE FROM oidc_login WHERE state=%s AND created_at > now() - %s * interval '1 minute' RETURNING verifier, nonce, return_to, binding_hash",
                        (state, STATE_MINUTES)).fetchone()
     conn.commit()
     if not row:
-        raise FederationError("the sign-in attempt is unknown or expired; start again")
+        raise TokenError("the sign-in attempt is unknown or expired; start again")
+    expected, stored = _binding(state, str(row["nonce"])), row["binding_hash"] or ""
+    if not binding or not stored or not hmac.compare_digest(binding.encode(), expected.encode()) or not hmac.compare_digest(stored.encode(), expected.encode()):
+        raise TokenError("this sign-in was not started in this browser; start again")
     with http_factory() as c:
-        r = c.post(GITHUB_TOKEN, data={"client_id": cfg["client_id"], "client_secret": core.vault.decrypt(cfg["client_secret_enc"]), "code": code,
+        r = c.post(GITHUB_TOKEN, data={"client_id": cfg["client_id"], "client_secret": _secret(conn, cfg), "code": code,
                                        "redirect_uri": redirect_uri, "code_verifier": row["verifier"]}, headers={"Accept": "application/json"})
         token = r.json().get("access_token") if r.status_code == 200 else None
         if not token:
@@ -144,16 +170,16 @@ def _github_identity(conn, cfg: dict, redirect_uri: str, code: str, state: str) 
             "name": p.get("name") or p.get("login") or ""}, row["return_to"]
 
 
-def finish(conn, provider: str, base_url: str, code: str, state: str) -> tuple[dict, str]:
-    """Complete an upstream sign-in. Returns (local user, return_to). Raises FederationError."""
+def finish(conn, provider: str, base_url: str, code: str, state: str, binding: str | None) -> tuple[dict, str]:
+    """Complete an upstream sign-in. `binding` is the browser's binding cookie (None when absent). Returns (local user, return_to).
+    Raises FederationError."""
     cfg = _config(conn, provider)
     redirect_uri = _callback(base_url, provider)
     try:
         if provider == "google":
-            rp = RelyingParty(GOOGLE_ISSUER, cfg["client_id"], lambda: core.vault.decrypt(cfg["client_secret_enc"]), http=http_factory, scopes="openid email profile")
-            claims, back, _ = rp.finish(conn, redirect_uri, code, state)
+            claims, back, _ = _google(conn, cfg).finish(conn, redirect_uri, code, state, binding)
         else:
-            claims, back = _github_identity(conn, cfg, redirect_uri, code, state)
+            claims, back = _github_identity(conn, cfg, redirect_uri, code, state, binding)
     except TokenError as exc:
         raise FederationError(str(exc)) from exc
     user = resolve(conn, cfg, provider, claims)

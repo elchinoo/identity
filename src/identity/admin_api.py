@@ -2,7 +2,8 @@
 import contextlib
 
 from apgkit import insights
-from fastapi import APIRouter, Depends, HTTPException
+from apgkit.vault import VaultError
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import apps, audit, core, federation, keys, users
@@ -19,6 +20,11 @@ class UserBody(_Body):
     name: str = Field("", max_length=120)
     password: str | None = Field(None, max_length=256)
     groups: list[str] = Field(default_factory=list, max_length=50)
+
+
+class RotateVaultBody(_Body):
+    password: str | None = Field(None, max_length=256)
+    confirm: bool = False
 
 
 class UserPatch(_Body):
@@ -306,6 +312,26 @@ def build_router(auth, keys_forget) -> APIRouter:
             out = keys.emergency_rotate(conn, actor(p), body.reason)
         keys_forget()
         return out
+
+    @r.post("/vault/rotate-key")
+    def rotate_vault_key(body: RotateVaultBody, request: Request, p=write):
+        """New vault data key; every stored secret re-encrypted. Needs the admin password even for a full admin session. Restart the
+        other replicas afterwards (they hold the old key in memory)."""
+        if not body.confirm:
+            raise HTTPException(422, 'this replaces the vault data key; other replicas must be restarted: send {"confirm": true, "password": "..."}')
+        if not vault.is_unlocked():
+            raise HTTPException(423, "unlock the vault first")
+        ip = auth.client(request)
+        if auth.limiter.limited(ip):
+            raise HTTPException(429, "too many failed attempts; wait a minute")
+        try:
+            with db.connect() as conn:
+                counts = keys.rotate_vault_key(conn, actor(p), body.password)
+        except VaultError as exc:
+            auth.limiter.record(ip)
+            raise HTTPException(403, str(exc)) from exc
+        keys_forget()
+        return {"rotated": counts, "restart_other_replicas": True}
 
     # ---- federation ----
     @r.get("/federation", dependencies=[read])

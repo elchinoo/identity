@@ -30,6 +30,20 @@ def _db_probe() -> dict[str, float]:
 
 metrics.add_insights_collector(lambda: db.connect(retries=1))  # db_insights_* gauges (EDB query statistics), cached; db_insights_available 0 on plain Postgres
 metrics.add_db_collector(_db_probe)                          # db_up is 1 when a connection and a trivial query work, else 0
+def bind_host() -> str:
+    """The address the server binds to (IDENTITY_HOST, else HOST, default all interfaces). IDENTITY_ALLOW_ANONYMOUS is honoured only
+    when this is a loopback address (or IDENTITY_ALLOW_ANONYMOUS_PUBLIC=1)."""
+    return os.environ.get("IDENTITY_HOST") or os.environ.get("HOST") or "0.0.0.0"  # noqa: S104
+
+
+# Where the vault encrypts, as contexts: a ciphertext copied to another row or column does not open.
+CTX_SIGNING_KEY = "signing_key.private_enc:{kid}"
+CTX_PROVIDER_SECRET = "federation_provider.client_secret_enc:{provider}"
+vault.register_store("signing_key", "SELECT kid, private_enc AS value FROM signing_key",
+                     "UPDATE signing_key SET private_enc = %(value)s WHERE kid = %(kid)s", context=CTX_SIGNING_KEY)
+vault.register_store("federation_provider", "SELECT provider, client_secret_enc AS value FROM federation_provider",
+                     "UPDATE federation_provider SET client_secret_enc = %(value)s WHERE provider = %(provider)s", context=CTX_PROVIDER_SECRET)
+
 login_limiter = FailureLimiter(window=300, limit=10)        # sign-in failures per client address / per username
 
 # The operator console is governed by one permission set; the local admin password (always available, never federated)
@@ -46,7 +60,7 @@ local = LocalAuth(APP_AUTH, env_prefix="IDENTITY", token_prefix="idt_", token_sc
 #  * IDENTITY_DEPLOY_KEY: a narrow credential for deploy tooling. It can read, register and update apps, create groups and make grants
 #    (DEPLOY_PERMISSIONS); it cannot reset a client secret, delete anything, create users, rotate keys or touch federation.
 DEPLOY_PERMISSIONS = frozenset({"admin:read", "apps:write", "groups:write", "grants:write"})
-auth = Authenticator(APP_AUTH, local, db, cookie_name=COOKIE_ADMIN, allow_anonymous=env_bool("IDENTITY_ALLOW_ANONYMOUS"),
+auth = Authenticator(APP_AUTH, local, db, cookie_name=COOKIE_ADMIN, allow_anonymous=lambda: env_bool("IDENTITY_ALLOW_ANONYMOUS"), bind_host=bind_host(),
                      static_tokens=[(lambda: read_secret("IDENTITY_API_KEY_NEXT"), Principal("static", "static-key-next", frozenset({WILDCARD}), name="api key (next)")),
                                     (lambda: read_secret("IDENTITY_DEPLOY_KEY"), Principal("static", "deploy-key", DEPLOY_PERMISSIONS, name="deploy key"))])
 

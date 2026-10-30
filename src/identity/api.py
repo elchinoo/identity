@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import hmac
 import sys
 import time
 from pathlib import Path
@@ -10,6 +9,7 @@ import psycopg
 from apgkit import __version__ as kit_version  # noqa: F401
 from apgkit import masking
 from apgkit import vault as vault_mod
+from apgkit.auth.rp import BINDING_COOKIE, clear_binding
 from apgkit.guard import SecurityGuard
 from apgkit.web import is_https, mount_kit_static, public_url
 from authlib.oauth2.rfc6749 import OAuth2Error
@@ -175,7 +175,7 @@ def login_options():
 
 @app.post("/login")
 def login(body: LoginBody, request: Request, response: Response):
-    ip = request.client.host if request.client else "?"
+    ip = auth.client(request)
     who = body.username.strip().lower()
     if login_limiter.limited(ip) or login_limiter.limited("u:" + who):
         raise HTTPException(429, "too many failed attempts; wait a few minutes")
@@ -194,48 +194,39 @@ def login(body: LoginBody, request: Request, response: Response):
     return {"next": core.safe_next(body.next)}
 
 
-COOKIE_FED = "idp_fed"                  # binds an upstream sign-in attempt to the browser that started it
-FED_COOKIE_PATH = "/login"
-
-
 @app.get("/login/{provider}")
 def login_upstream(provider: str, request: Request, next: str | None = None):
     try:
         with db.connect(retries=1) as conn:
-            url = federation.begin(conn, provider, public_url(request, "IDENTITY_PUBLIC_URL"), next)
+            login = federation.begin(conn, provider, public_url(request, "IDENTITY_PUBLIC_URL"), next)
     except federation.FederationError as exc:
         return RedirectResponse(f"/login?{urlencode({'error': str(exc)})}", status_code=303)
-    resp = RedirectResponse(url, status_code=303)
-    resp.set_cookie(COOKIE_FED, federation.state_of(url), httponly=True, samesite="lax", secure=is_https(request),
-                    max_age=federation.STATE_MINUTES * 60, path=FED_COOKIE_PATH)
+    resp = RedirectResponse(login.url, status_code=303)
+    login.bind(resp, secure=is_https(request))             # the kit's browser-binding cookie: the callback must arrive in this browser
     return resp
 
 
-def _fed_failed(message: str) -> RedirectResponse:
+def _fed_failed(request: Request, message: str) -> RedirectResponse:
     resp = RedirectResponse(f"/login?{urlencode({'error': message})}", status_code=303)
-    resp.delete_cookie(COOKIE_FED, path=FED_COOKIE_PATH)
+    clear_binding(resp, secure=is_https(request))
     return resp
 
 
 @app.get("/login/{provider}/callback")
 def login_upstream_callback(provider: str, request: Request, code: str = "", state: str = "", error: str = ""):
     if error or not code or not state:
-        return _fed_failed("the sign-in was cancelled or failed")
-    # the state must come back in the browser that began the attempt (login CSRF); compared in constant time, and the cookie is single use
-    bound = request.cookies.get(COOKIE_FED, "")
-    if not bound or not hmac.compare_digest(bound.encode(), state.encode()):
-        return _fed_failed("the sign-in attempt does not belong to this browser; start again")
+        return _fed_failed(request, "the sign-in was cancelled or failed")
     try:
         with db.connect(retries=1) as conn:
-            user, back = federation.finish(conn, provider, public_url(request, "IDENTITY_PUBLIC_URL"), code, state)
+            user, back = federation.finish(conn, provider, public_url(request, "IDENTITY_PUBLIC_URL"), code, state, request.cookies.get(BINDING_COOKIE))
             resp = RedirectResponse(back, status_code=303)
             start_sso(conn, request, resp, user)
             audit.log(conn, user["username"], "login_federated", provider)
             conn.commit()
-            resp.delete_cookie(COOKIE_FED, path=FED_COOKIE_PATH)
+            clear_binding(resp, secure=is_https(request))
             return resp
     except federation.FederationError as exc:
-        return _fed_failed(str(exc))
+        return _fed_failed(request, str(exc))
 
 
 @app.post("/logout")
@@ -414,7 +405,7 @@ def _admin_session(conn, request: Request, response: Response) -> None:
 
 
 def _guard(request: Request) -> str:
-    ip = request.client.host if request.client else "?"
+    ip = auth.client(request)
     if auth.limiter.limited(ip):
         raise HTTPException(429, "too many failed attempts; wait a minute")
     return ip
@@ -471,17 +462,21 @@ def setup(body: SetupBody, request: Request, response: Response):
 
 @app.post("/api/login")
 def admin_login(body: AdminLoginBody, request: Request, response: Response):
-    ip = _guard(request)
+    ip = auth.client(request)
     try:
         with db.connect(retries=1) as conn:
             ok = False
             if body.password is not None:
-                ok = local.login_password(conn, body.password)
-            elif body.api_key is not None and local.static_key_matches(body.api_key):
-                ok = True
-                vault.try_unlock_with_platform_secret(conn)
+                # counted before hashing (one scrypt per attempt); 429 over the limit, 503 (ScryptBusy) when every scrypt slot is taken
+                ok = local.login_password(conn, body.password, client=ip, limiter=auth.limiter)
+            else:
+                _guard(request)
+                if body.api_key is not None and local.static_key_matches(body.api_key):
+                    ok = True
+                    vault.try_unlock_with_platform_secret(conn)
+                else:
+                    auth.limiter.record(ip)
             if not ok:
-                auth.limiter.record(ip)
                 raise HTTPException(401, "invalid credentials")
             _admin_session(conn, request, response)
     except (psycopg.Error, RuntimeError) as exc:

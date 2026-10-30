@@ -165,7 +165,8 @@ def test_state_is_bound_to_the_browser_that_started_the_login(idp, monkeypatch):
     w, up = setup(idp, monkeypatch)
     victim_start = TestClient(idp.app, base_url=BASE).get("/login/google", follow_redirects=False)
     cookie = victim_start.headers["set-cookie"].lower()
-    assert "idp_fed=" in cookie and "httponly" in cookie and "samesite=lax" in cookie and "max-age=600" in cookie and "path=/login" in cookie
+    assert "apg_oidc_bind=" in cookie and "httponly" in cookie and "samesite=lax" in cookie and "max-age=600" in cookie and "path=/" in cookie
+    assert "idp_fed" not in cookie                                                        # one mechanism: the kit's binding cookie
     attacker = TestClient(idp.app, base_url=BASE)
     start = attacker.get("/login/google", follow_redirects=False)
     q = parse_qs(urlsplit(start.headers["location"]).query)
@@ -177,10 +178,16 @@ def test_state_is_bound_to_the_browser_that_started_the_login(idp, monkeypatch):
     other.get("/login/google", follow_redirects=False)                                    # now with a cookie, but for another state
     r = other.get("/login/google/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
     assert r.headers["location"].startswith("/login?error=") and "idp_sso" not in r.cookies
-    # the genuine browser still completes, and the cookie is single use
+    # a refused callback consumes the state (single use), so the stolen state is dead for the genuine browser too
+    r = attacker.get("/login/google/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
+    assert r.headers["location"].startswith("/login?error=") and "idp_sso" not in r.cookies
+    # a fresh attempt in the genuine browser completes, clears the binding cookie, and cannot be replayed
+    start = attacker.get("/login/google", follow_redirects=False)
+    q = parse_qs(urlsplit(start.headers["location"]).query)
+    up.last_nonce = q["nonce"][0]
     r = attacker.get("/login/google/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/" and "idp_sso" in r.cookies
-    assert "idp_fed" not in attacker.cookies
+    assert "apg_oidc_bind" not in attacker.cookies
     again = attacker.get("/login/google/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
     assert again.headers["location"].startswith("/login?error=")
 
@@ -191,3 +198,25 @@ def test_forwarded_allow_ips_is_never_a_wildcard_by_default(monkeypatch):
     assert cli.forwarded_allow_ips() == "127.0.0.1"
     monkeypatch.setenv("IDENTITY_FORWARDED_ALLOW_IPS", "10.1.2.3")
     assert cli.forwarded_allow_ips() == "10.1.2.3"
+
+
+def test_callback_without_the_binding_cookie_is_refused_for_google_and_github(idp, monkeypatch):
+    w, up = setup(idp, monkeypatch)
+    for provider in ("google", "github"):
+        browser = TestClient(idp.app, base_url=BASE)
+        start = browser.get(f"/login/{provider}", follow_redirects=False)
+        q = parse_qs(urlsplit(start.headers["location"]).query)
+        up.last_nonce = q.get("nonce", ["-"])[0]
+        stranger = TestClient(idp.app, base_url=BASE)                                      # no cookie at all
+        r = stranger.get(f"/login/{provider}/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
+        assert r.headers["location"].startswith("/login?error=") and "idp_sso" not in r.cookies
+        # the state was consumed by that refusal: even the genuine browser cannot reuse it
+        again = browser.get(f"/login/{provider}/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
+        assert again.headers["location"].startswith("/login?error=") and "idp_sso" not in again.cookies
+        # a forged cookie value is refused as well
+        start = browser.get(f"/login/{provider}", follow_redirects=False)
+        q = parse_qs(urlsplit(start.headers["location"]).query)
+        up.last_nonce = q.get("nonce", ["-"])[0]
+        browser.cookies.set("apg_oidc_bind", "0" * 64)
+        bad = browser.get(f"/login/{provider}/callback", params={"code": "c", "state": q["state"][0]}, follow_redirects=False)
+        assert bad.headers["location"].startswith("/login?error=") and "idp_sso" not in bad.cookies

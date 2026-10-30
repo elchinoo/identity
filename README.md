@@ -51,9 +51,12 @@ such as `trustdesk`. Scopes address one audience app by their prefix.
 | `DATABASE_URL` / `DB_EXTERNAL_DSN` / `PSQL_CONNECTION_STRING` | Postgres, which must be a UTF-8 database. |
 | `IDENTITY_PUBLIC_URL`, `IDENTITY_ISSUER` | The URL the provider is reached at; it becomes the token issuer, so set it once and keep it. Default: the first request's address. |
 | `IDENTITY_ENCRYPTION_KEY[_FILE]` | Platform secret that unlocks the vault (signing keys, provider secrets) at startup. |
-| `IDENTITY_API_KEY[_FILE]` | Optional static full-access key for automation. |
+| `IDENTITY_API_KEY[_FILE]` | Optional static full-access key for automation. At least 32 characters (a shorter key is refused); generate one with `openssl rand -base64 36`. |
 | `IDENTITY_API_KEY_NEXT[_FILE]` | A second full-access key accepted alongside the first, to rotate the admin key without a lockout. |
 | `IDENTITY_DEPLOY_KEY[_FILE]` | Optional narrow key for deploy tooling: read, register/update apps, create groups, make grants. Nothing destructive. |
+| `IDENTITY_FORWARDED_ALLOW_IPS` | Peers whose `X-Forwarded-*` headers are believed (default `127.0.0.1`; behind a proxy set its address, never `*`). |
+| `IDENTITY_TRUSTED_HOPS` | Proxies in front of the app for the client address used by the rate limits (default 1; 0 = the socket peer). |
+| `IDENTITY_HOST` / `HOST` | Bind address (default `0.0.0.0`). `IDENTITY_ALLOW_ANONYMOUS` is honoured only on loopback, or with `IDENTITY_ALLOW_ANONYMOUS_PUBLIC=1`. |
 | `IDENTITY_REFRESH_TTL_DAYS` | Refresh token lifetime, 1 to 365 days (default 30). |
 
 ## Documentation

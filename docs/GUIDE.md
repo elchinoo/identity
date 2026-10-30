@@ -278,13 +278,15 @@ Verified in `core.py`, `api.py`, `cli.py`, the kit (`config.py`, `vault.py`, `au
 | `IDENTITY_ISSUER` | `IDENTITY_PUBLIC_URL`, else the request address | The token issuer (`iss`). Wins over the public URL for tokens and discovery. Fixed for the life of the process by the first OAuth/discovery request. |
 | `IDENTITY_ENCRYPTION_KEY` | none | The **platform secret** that unlocks the vault at start-up (signing keys, provider secrets). Any long random value. If the vault does not exist yet and no admin password is set, it is created from this secret alone. |
 | `IDENTITY_ENCRYPTION_KEY_FILE` | `/etc/identity/encryption_key` | The same secret as a file (first line). Used only when the variable above is empty. |
-| `IDENTITY_API_KEY` | none | Optional static full-access key for automation (`Authorization: Bearer <key>` on `/api/*`, or the "Use the server's API key instead" sign-in in the console). While it is set and no admin password exists, **the setup-code flow is off** (`needs_setup` is false). |
+| `IDENTITY_API_KEY` | none | Optional static full-access key (**at least 32 characters**: a shorter key is refused and an error is logged; enabling one logs a startup warning) for automation (`Authorization: Bearer <key>` on `/api/*`, or the "Use the server's API key instead" sign-in in the console). While it is set and no admin password exists, **the setup-code flow is off** (`needs_setup` is false). |
 | `IDENTITY_API_KEY_FILE` | `/etc/identity/api_key` | The same key as a file. |
 | `IDENTITY_API_KEY_NEXT` / `_FILE` | none | A **second full-access key**, accepted alongside `IDENTITY_API_KEY`. Rotating the admin key without data loss or a lockout: (1) set `IDENTITY_API_KEY_NEXT` to the new value and restart; (2) move every caller (ecoctl state, CI) to the new key; (3) set `IDENTITY_API_KEY` to the new value, remove `IDENTITY_API_KEY_NEXT`, restart. Nothing is stored in the database, so nothing is lost. Keys are read from the environment or the file on each request and compared in constant time. |
 | `IDENTITY_DEPLOY_KEY` / `_FILE` | none | A **narrow credential for deploy tooling**. It holds `admin:read`, `apps:write`, `groups:write`, `grants:write`: list/read everything, register and update apps, create groups, make grants. It is refused (403) for: resetting a client secret, deleting apps, groups or grants, creating or changing users and passwords, signing-key rotation (graceful or emergency), federation, operator tokens and database insights. Those need the admin key, the admin password session or a `full` token. It is not a sandbox: it can change an app's redirect URIs and grant roles to existing users and groups, so keep it as secret as the admin key, just with a smaller blast radius. Today ecoctl and the Ansible recipe still use the admin key (they reset client secrets when re-registering an app); moving them to this key is a follow-up. |
 | `IDENTITY_REFRESH_TTL_DAYS` | `30` | Lifetime of refresh tokens issued from now on (1 to 365; anything else is ignored and the default applies). Tokens already issued keep their stored expiry. |
 | `IDENTITY_ALLOW_ANONYMOUS` | `false` | If true, every request to a protected route is treated as an administrator with full access. Never set this outside a throwaway test. |
-| `HOST` | `0.0.0.0` | Bind address of `identity serve|start`. |
+| `HOST` / `IDENTITY_HOST` | `0.0.0.0` | Bind address of `identity serve|start`. `IDENTITY_ALLOW_ANONYMOUS` is honoured only when this is a loopback address (or `IDENTITY_ALLOW_ANONYMOUS_PUBLIC=1` accepts the exposure); an unknown address counts as public. |
+| `IDENTITY_FORWARDED_ALLOW_IPS` | `127.0.0.1` | Peers whose `X-Forwarded-*` headers uvicorn believes. Behind a reverse proxy set it to the proxy's address; never `*`. |
+| `IDENTITY_TRUSTED_HOPS` | `1` | Number of proxies in front of the app when the client address is taken from `X-Forwarded-For` (rate limits, logs). `0` uses the socket peer. The app must be reachable only through that proxy. |
 | `PORT` | `8000` | Bind port. The image's `HEALTHCHECK` reads `PORT`, so keep it set (the image sets it). |
 | `SSL_CERT_FILE` | set by the image to `/etc/ssl/certs/ca-certificates.crt` | CA bundle for outbound and database TLS (`sslrootcert=system`). |
 
@@ -482,7 +484,7 @@ unlocked, otherwise `423`); the old key becomes `retiring` and stays published f
 Every change writes a row in `idp_audit` in the same transaction: actor, action, target, detail. Actions seen in code: `login_failed`,
 `login_federated`, `authorize`, `user_created`, `user_updated`, `password_reset`, `user_deleted`, `group_created`, `group_deleted`,
 `group_member_added`, `group_member_removed`, `app_registered`, `app_updated`, `app_secret_rotated`, `app_deleted`, `role_granted`,
-`role_revoked`, `signing_key_rotated`, `signing_key_emergency_rotated`, `federation_configured`, `federation_removed`. The API returns the latest 1 to 500 rows
+`role_revoked`, `signing_key_rotated`, `signing_key_emergency_rotated`, `vault_key_rotated`, `federation_configured`, `federation_removed`. The API returns the latest 1 to 500 rows
 (default 200). Operator-token actions are logged under the token's name, the admin password session as `admin`, the static key as `api key`.
 
 ### 7.8 Settings (console: Settings)
@@ -606,7 +608,10 @@ password.
 | App client secret | **Apps -> New secret** (or `POST /api/apps/{id}/secret`) | Old secret stops at once; update the app's environment and restart it. For the fleet: `ecoctl apply --execute --rotate`, then recreate the sandboxes whose environment changed |
 | Admin password | **Settings -> Admin password** | Signs out all local admin sessions; the vault is re-wrapped |
 | Operator token | **Settings**: create a new one, revoke the old | |
-| `IDENTITY_ENCRYPTION_KEY` | No rotate command exists. By code reading, the vault wraps a platform secret only when none was wrapped before (on password unlock); a **changed** secret is not re-wrapped, so the old one keeps unlocking and the new one does not. Treat the value as permanent for a database. | See limitations |
+| Vault data key | `identity rotate-vault-key --yes` (asks for the admin password; `IDENTITY_ADMIN_PASSWORD_FILE` for unattended use) or `POST /api/vault/rotate-key` with `{"confirm": true, "password": "..."}` (full admin only, the password is required even in an admin session) | New random data key; the signing keys and federation secrets are re-encrypted and both wraps rewritten in one transaction; legacy values are upgraded to the v2 format. Signing keys keep the same RSA key, so tokens already issued still verify. An audit row `vault_key_rotated` lists counts only. **Restart every other replica afterwards** (they hold the old key in memory and cannot decrypt until restarted or unlocked again), and stop admin writes meanwhile. Old database backups still open with the old key. All replicas of an app must run the same kit version |
+| `IDENTITY_ENCRYPTION_KEY` | The data-key rotation re-wraps the new key under the current value when one is set; without one, no platform wrap is kept and only the admin password unlocks. Changing the secret itself without rotating: a changed secret is re-wrapped automatically on the next admin-password unlock. | See limitations |
+
+Stored secrets are AES-256-GCM tokens bound to their row (`signing_key.private_enc:<kid>`, `federation_provider.client_secret_enc:<provider>`): a ciphertext copied to another row does not open. Values written by older versions still open and are upgraded when read or on the next vault rotation. Without `IDENTITY_ENCRYPTION_KEY` the vault runs in admin-password-only mode: after every restart someone signs in to the console (or calls `/api/vault/unlock`) before tokens can be signed.
 
 ### 10.4 The vault and unlocking
 
@@ -747,7 +752,7 @@ Admin (full access `*` for writes, `admin:read` for the `GET`s):
 | Groups | `GET|POST /api/groups`, `DELETE /api/groups/{name}` |
 | Apps | `GET|POST /api/apps`, `GET|PATCH|DELETE /api/apps/{client_id}`, `POST /api/apps/{client_id}/secret` |
 | Grants | `GET|POST /api/grants` (`?client_id=`), `DELETE /api/grants/{id}`; a grant body is `{subject_type: user|group, subject: <user id or group name>, client_id, role}` |
-| Keys | `GET /api/keys`, `POST /api/keys/rotate` |
+| Keys | `GET /api/keys`, `POST /api/keys/rotate`, `POST /api/vault/rotate-key` |
 | Federation | `GET /api/federation`, `PUT|DELETE /api/federation/{provider}` |
 | Audit | `GET /api/audit?limit=` |
 | Metrics | `GET /metrics` (scope `metrics:scrape`) |

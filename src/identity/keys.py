@@ -41,7 +41,7 @@ def rotate(conn, first: bool = False) -> str:
     key = _generate(kid)
     conn.execute("UPDATE signing_key SET status='retiring', retire_at=%s WHERE status='active'", (datetime.now(UTC) + RETIRE_AFTER,))
     conn.execute("INSERT INTO signing_key (kid, alg, private_enc, public_jwk) VALUES (%s,'RS256',%s,%s)",
-                 (kid, core.vault.encrypt(key.as_pem(private=True).decode()), Jsonb(key.as_dict(private=False))))
+                 (kid, core.vault.encrypt(key.as_pem(private=True).decode(), core.CTX_SIGNING_KEY.format(kid=kid)), Jsonb(key.as_dict(private=False))))
     conn.execute("UPDATE signing_key SET status='retired' WHERE status='retiring' AND retire_at < now()")
     conn.commit()
     with _lock:
@@ -60,7 +60,7 @@ def emergency_rotate(conn, actor: str = "cli", reason: str = "") -> dict:
     old = [r["kid"] for r in conn.execute("SELECT kid FROM signing_key").fetchall()]
     conn.execute("DELETE FROM signing_key")
     conn.execute("INSERT INTO signing_key (kid, alg, private_enc, public_jwk) VALUES (%s,'RS256',%s,%s)",
-                 (kid, core.vault.encrypt(key.as_pem(private=True).decode()), Jsonb(key.as_dict(private=False))))
+                 (kid, core.vault.encrypt(key.as_pem(private=True).decode(), core.CTX_SIGNING_KEY.format(kid=kid)), Jsonb(key.as_dict(private=False))))
     refresh = conn.execute("UPDATE oauth_refresh SET revoked_at = now() WHERE revoked_at IS NULL").rowcount
     codes = conn.execute("DELETE FROM oauth_code").rowcount
     sessions = conn.execute("DELETE FROM web_session WHERE source <> 'local'").rowcount
@@ -71,6 +71,19 @@ def emergency_rotate(conn, actor: str = "cli", reason: str = "") -> dict:
     conn.commit()
     forget()
     return {"kid": kid, **detail}
+
+
+def rotate_vault_key(conn, actor: str, password: str | None) -> dict[str, int]:
+    """Replace the vault data key: every encrypted value (signing keys, federation secrets) is re-encrypted and the password and platform
+    wraps rewritten in one transaction (agentpg-kit `Vault.rotate_data_key`). Needs the vault unlocked and, when an admin password
+    exists, that password. Raises `VaultError` (wrong password, locked) without changing anything. Other replicas keep the old key in
+    memory until restarted. The audit row carries counts only, never a secret."""
+    conn.commit()                                              # rotate_data_key needs an idle connection
+    counts = core.vault.rotate_data_key(conn, password=password)
+    audit.log(conn, actor, "vault_key_rotated", "", **counts)
+    conn.commit()
+    forget()
+    return counts
 
 
 def signing_key(conn) -> RSAKey:
@@ -85,7 +98,12 @@ def signing_key(conn) -> RSAKey:
         if _cache["key"] is not None and _cache["kid"] == row["kid"]:       # still the same key: just start a new interval
             _cache["at"] = _now()
             return _cache["key"]
-    key = RSAKey.import_key(core.vault.decrypt(row["private_enc"]), {"kid": row["kid"], "use": "sig", "alg": "RS256"})
+    ctx = core.CTX_SIGNING_KEY.format(kid=row["kid"])
+    pem = core.vault.decrypt(row["private_enc"], ctx)
+    if core.vault.is_legacy(row["private_enc"]):                 # written before contexts: bind it to its row now (read-through upgrade)
+        conn.execute("UPDATE signing_key SET private_enc=%s WHERE kid=%s AND private_enc=%s", (core.vault.encrypt(pem, ctx), row["kid"], row["private_enc"]))
+        conn.commit()
+    key = RSAKey.import_key(pem, {"kid": row["kid"], "use": "sig", "alg": "RS256"})
     with _lock:
         _cache.update(kid=row["kid"], key=key, at=_now())
     return key

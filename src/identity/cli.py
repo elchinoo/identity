@@ -1,9 +1,12 @@
 import argparse
+import getpass
 import os
 import sys
+from pathlib import Path
 
 from apgkit import migrate as kit_migrate
 from apgkit.auth.schema import SQL as AUTH_SQL
+from apgkit.vault import VaultError
 
 from . import audit, core, hardening, keys
 
@@ -26,7 +29,7 @@ def forwarded_allow_ips() -> str:
 def _serve() -> None:
     import uvicorn
 
-    uvicorn.run("identity.api:app", host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "8000")),
+    uvicorn.run("identity.api:app", host=core.bind_host(), port=int(os.environ.get("PORT", "8000")),
                 proxy_headers=True, forwarded_allow_ips=forwarded_allow_ips())
 
 
@@ -53,6 +56,35 @@ def _rotate_keys(args) -> int:
     return 0
 
 
+def _rotate_vault_key(args) -> int:
+    """Replace the vault data key and re-encrypt every stored secret. Asks for the admin password (or reads IDENTITY_ADMIN_PASSWORD_FILE
+    for unattended use). Restart every other identity replica afterwards."""
+    if not args.yes:
+        print("refusing: this replaces the vault data key and re-encrypts every stored secret; other replicas must be restarted afterwards. "
+              "Add --yes to proceed", file=sys.stderr)
+        return 2
+    with core.db.connect() as conn:
+        has_password = core.vault.has_password_wrap(conn)
+        password = None
+        if has_password:
+            path = os.environ.get("IDENTITY_ADMIN_PASSWORD_FILE")
+            password = Path(path).read_text().rstrip("\n") if path else getpass.getpass("Admin password: ")
+        core.vault.try_unlock_with_platform_secret(conn)
+        try:
+            if not core.vault.is_unlocked() and password is not None:
+                core.vault.unlock_with_password(conn, password)
+            if not core.vault.is_unlocked():
+                print("the vault is locked: the admin password is wrong, or set IDENTITY_ENCRYPTION_KEY for this command", file=sys.stderr)
+                return 1
+            counts = keys.rotate_vault_key(conn, "cli", password)
+        except VaultError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+    print("vault data key rotated; re-encrypted " + ", ".join(f"{n} {k}" for k, n in counts.items()) +
+          ". Restart every other identity replica now: they still hold the old key.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="identity")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -63,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     rk.add_argument("--emergency", action="store_true", help="remove every old key from the JWKS at once, revoke all refresh tokens, end SSO sessions")
     rk.add_argument("--yes", action="store_true", help="required with --emergency")
     rk.add_argument("--reason", default="", help="recorded in the audit log")
+    rv = sub.add_parser("rotate-vault-key", help="replace the vault data key and re-encrypt every stored secret (asks for the admin password)")
+    rv.add_argument("--yes", action="store_true", help="required: confirms the rotation")
     sub.add_parser("reset-admin", help="forget the admin password and vault (recovery)")
     args = p.parse_args(argv)
     if args.cmd == "migrate":
@@ -88,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
         _serve()
     elif args.cmd == "rotate-keys":
         return _rotate_keys(args)
+    elif args.cmd == "rotate-vault-key":
+        return _rotate_vault_key(args)
     elif args.cmd == "reset-admin":
         with core.db.connect() as conn:
             core.local.reset_admin(conn)
