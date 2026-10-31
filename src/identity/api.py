@@ -8,9 +8,11 @@ from urllib.parse import urlencode
 import psycopg
 from apgkit import __version__ as kit_version  # noqa: F401
 from apgkit import masking
+from apgkit import sealed as sealing
 from apgkit import vault as vault_mod
 from apgkit.auth.rp import BINDING_COOKIE, clear_binding
 from apgkit.guard import SecurityGuard
+from apgkit.vault import sealed_unlocker
 from apgkit.web import is_https, mount_kit_static, public_url
 from authlib.oauth2.rfc6749 import OAuth2Error
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -19,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, apps, audit, core, federation, hardening, keys, oauth, users
+from . import __version__, apps, audit, cli, core, federation, hardening, keys, oauth, users
 from .core import COOKIE_ADMIN, COOKIE_SSO, CSRF_HEADER, auth, db, local, login_limiter, metrics, vault
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -39,6 +41,7 @@ def _announce() -> None:
 
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
+    auth.check_static_key()                    # reads IDENTITY_API_KEY through read_secret: only now, after any unseal
     try:
         with db.connect(retries=2) as conn:
             core.check_encoding(conn)
@@ -62,7 +65,25 @@ async def lifespan(_: FastAPI):
         db.close_pool()
 
 
-app = FastAPI(title="Identity", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+sealed = sealing.Sealed.from_env()           # sealed boot (APGKIT_SEALED): with no blob configured nothing changes
+app = FastAPI(title="Identity", version=__version__, lifespan=sealed.deferred(lifespan), docs_url=None, redoc_url=None, openapi_url=None)
+sealing.install(app, sealed)                 # the 503 gate and /_seal/* routes
+_open_vault = sealed_unlocker(vault, db.connect)         # opens (or creates) the vault with the operator's passphrase: signing keys stay passphrase-wrapped
+
+
+def _start_after_unseal(unsealed, passphrase) -> None:
+    """`identity start` cannot migrate before serving when sealed (no DATABASE_URL yet), and the vault lives in a table the migrations
+    create, so: migrate, then open the vault. A failure leaves the app sealed (the operator sees the reason in the log)."""
+    try:
+        applied = cli.run_migrations()
+        print("migrations applied:", ", ".join(applied) if applied else "none (up to date)", flush=True)
+        _open_vault(unsealed, passphrase)
+    except Exception as exc:
+        print(f"sealed start failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        raise
+
+
+sealed.on_unsealed(_start_after_unseal)
 app.add_middleware(SecurityGuard, csrf_header=CSRF_HEADER, csrf_prefixes=("/api/", "/login"), body_prefixes=("/api/", "/login", "/oauth/"),
                    observe=metrics.observe)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")

@@ -59,6 +59,16 @@ such as `trustdesk`. Scopes address one audience app by their prefix.
 | `IDENTITY_HOST` / `HOST` | Bind address (default `0.0.0.0`). `IDENTITY_ALLOW_ANONYMOUS` is honoured only on loopback, or with `IDENTITY_ALLOW_ANONYMOUS_PUBLIC=1`. |
 | `IDENTITY_REFRESH_TTL_DAYS` | Refresh token lifetime, 1 to 365 days (default 30). |
 
+## Sealed boot
+
+Anything in an app's environment, config files or image is readable by whoever breaches the platform. With sealed boot, Identity is
+deployed with ONE variable: `APGKIT_SEALED`, a blob encrypted (AES-256-GCM) under an operator passphrase. It holds `DATABASE_URL`,
+`IDENTITY_API_KEY` and any other secret; set nothing else secret. Make it with `ecoctl seal` (agentpg-ecosystem). Identity starts
+sealed: every route answers 503 except `/_seal/*`, `/healthz`, `/health` and `/livez`. The operator sends the passphrase (encrypted to
+an ephemeral in-process key, `ecoctl unseal`); Identity then opens the blob, applies the migrations, opens or creates the vault with the
+same passphrase (the signing keys stay wrapped under that passphrase alone; `IDENTITY_ENCRYPTION_KEY` is ignored) and serves. After a
+restart it is sealed again. With no `APGKIT_SEALED` nothing changes.
+
 ## Documentation
 
 The complete guide is [docs/GUIDE.md](docs/GUIDE.md): how Identity fits the ecosystem, architecture, install, every setting,

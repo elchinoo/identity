@@ -60,7 +60,18 @@ local = LocalAuth(APP_AUTH, env_prefix="IDENTITY", token_prefix="idt_", token_sc
 #  * IDENTITY_DEPLOY_KEY: a narrow credential for deploy tooling. It can read, register and update apps, create groups and make grants
 #    (DEPLOY_PERMISSIONS); it cannot reset a client secret, delete anything, create users, rotate keys or touch federation.
 DEPLOY_PERMISSIONS = frozenset({"admin:read", "apps:write", "groups:write", "grants:write"})
-auth = Authenticator(APP_AUTH, local, db, cookie_name=COOKIE_ADMIN, allow_anonymous=lambda: env_bool("IDENTITY_ALLOW_ANONYMOUS"), bind_host=bind_host(),
+class _LazyAuthenticator(Authenticator):
+    """The kit's Authenticator reads IDENTITY_API_KEY in its constructor (to log a warning). Under sealed boot that value does not
+    exist at import, so the check is skipped here and run from the lifespan (`check_static_key`), after unseal."""
+
+    def _check_static_key(self) -> None:
+        return None
+
+    def check_static_key(self) -> None:
+        Authenticator._check_static_key(self)
+
+
+auth = _LazyAuthenticator(APP_AUTH, local, db, cookie_name=COOKIE_ADMIN, allow_anonymous=lambda: env_bool("IDENTITY_ALLOW_ANONYMOUS"), bind_host=bind_host(),
                      static_tokens=[(lambda: read_secret("IDENTITY_API_KEY_NEXT"), Principal("static", "static-key-next", frozenset({WILDCARD}), name="api key (next)")),
                                     (lambda: read_secret("IDENTITY_DEPLOY_KEY"), Principal("static", "deploy-key", DEPLOY_PERMISSIONS, name="deploy key"))])
 

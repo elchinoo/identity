@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from apgkit import migrate as kit_migrate
+from apgkit import sealed as sealing
 from apgkit.auth.schema import SQL as AUTH_SQL
 from apgkit.vault import VaultError
 
@@ -107,6 +108,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print("applied:", ", ".join(applied) if applied else "nothing (up to date)")
     elif args.cmd == "serve":
+        _serve()
+    elif args.cmd == "start" and sealing.Sealed.from_env().enabled:
+        print("sealed boot: starting without migrating; migrations run after the operator unseals the app")
         _serve()
     elif args.cmd == "start":
         try:
