@@ -4,6 +4,7 @@ import re
 import psycopg
 from apgkit import passwords
 
+from . import rowmac
 from .ids import new_user_id
 
 USERNAME = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
@@ -48,6 +49,7 @@ def create_user(conn, *, username: str, email: str, name: str = "", password: st
     except psycopg.errors.UniqueViolation as exc:
         conn.rollback()
         raise UserError("that username or e-mail address is already in use") from exc
+    rowmac.seal(conn, "idp_user", "id=%s", (uid,))
     for g in groups or []:
         add_to_group(conn, uid, g)
     conn.commit()
@@ -55,13 +57,15 @@ def create_user(conn, *, username: str, email: str, name: str = "", password: st
 
 
 def get(conn, user_id: str) -> dict:
-    row = conn.execute("SELECT id, username, email, name, status, (password_hash IS NOT NULL) AS has_password, created_at, last_login_at "
-                       "FROM idp_user WHERE id=%s", (user_id,)).fetchone()
-    if not row:
+    row = conn.execute("SELECT * FROM idp_user WHERE id=%s", (user_id,)).fetchone()
+    if not row or not rowmac.verify_row("idp_user", row):
         raise NotFound("no such user")
-    row["groups"] = [r["name"] for r in conn.execute(
-        "SELECT g.name FROM idp_group g JOIN idp_membership m ON m.group_id=g.id WHERE m.user_id=%s ORDER BY g.name", (user_id,))]
-    return row
+    out = {k: row[k] for k in ("id", "username", "email", "name", "status", "created_at", "last_login_at")}
+    out["has_password"] = row["password_hash"] is not None
+    out["groups"] = sorted(r["name"] for r in conn.execute(
+        "SELECT g.name, m.* FROM idp_group g JOIN idp_membership m ON m.group_id=g.id WHERE m.user_id=%s", (user_id,))
+        if rowmac.verify_row("idp_membership", r))
+    return out
 
 
 def listing(conn, query: str | None = None, limit: int = 200) -> list[dict]:
@@ -71,7 +75,13 @@ def listing(conn, query: str | None = None, limit: int = 200) -> list[dict]:
                             (like, like, like, limit)).fetchall()
     else:
         rows = conn.execute("SELECT id FROM idp_user ORDER BY username LIMIT %s", (limit,)).fetchall()
-    return [get(conn, r["id"]) for r in rows]
+    out = []
+    for r in rows:
+        try:
+            out.append(get(conn, r["id"]))
+        except NotFound:                                  # a row without a valid MAC is not listed
+            continue
+    return out
 
 
 def update(conn, user_id: str, *, name: str | None = None, email: str | None = None, status: str | None = None) -> dict:
@@ -79,14 +89,14 @@ def update(conn, user_id: str, *, name: str | None = None, email: str | None = N
     if status is not None and status not in {"active", "disabled"}:
         raise UserError("status must be active or disabled")
     try:
-        conn.execute("UPDATE idp_user SET name=%s, email=%s, status=%s WHERE id=%s",
-                     ((name if name is not None else cur["name"]).strip()[:120], _clean_email(email) if email else cur["email"],
-                      status or cur["status"], user_id))
+        rowmac.update(conn, "idp_user", "name=%s, email=%s, status=%s",
+                      ((name if name is not None else cur["name"]).strip()[:120], _clean_email(email) if email else cur["email"], status or cur["status"]),
+                      "id=%s", (user_id,))
     except psycopg.errors.UniqueViolation as exc:
         conn.rollback()
         raise UserError("another user already has that e-mail address") from exc
     if status == "disabled":                               # a disabled person's refresh tokens stop working at once
-        conn.execute("UPDATE oauth_refresh SET revoked_at = now() WHERE user_id=%s AND revoked_at IS NULL", (user_id,))
+        rowmac.update(conn, "oauth_refresh", "revoked_at = now()", (), "user_id=%s AND revoked_at IS NULL", (user_id,))
     conn.commit()
     return get(conn, user_id)
 
@@ -97,16 +107,16 @@ def set_password(conn, user_id: str, password: str) -> None:
         passwords.check_strength(password)
     except ValueError as exc:
         raise UserError(str(exc)) from exc
-    conn.execute("UPDATE idp_user SET password_hash=%s WHERE id=%s", (passwords.hash_password(password), user_id))
-    conn.execute("UPDATE oauth_refresh SET revoked_at = now() WHERE user_id=%s AND revoked_at IS NULL", (user_id,))
+    rowmac.update(conn, "idp_user", "password_hash=%s", (passwords.hash_password(password),), "id=%s", (user_id,))
+    rowmac.update(conn, "oauth_refresh", "revoked_at = now()", (), "user_id=%s AND revoked_at IS NULL", (user_id,))
     conn.commit()
 
 
 def authenticate(conn, login: str, password: str) -> dict | None:
     """The user for a username-or-e-mail and password, or None. Takes the same time whether or not the user exists."""
     login = (login or "").strip().lower()
-    row = conn.execute("SELECT id, password_hash, status FROM idp_user WHERE username=%s OR lower(email)=%s ORDER BY (username=%s) DESC LIMIT 1",
-                       (login, login, login)).fetchone()
+    rows = conn.execute("SELECT * FROM idp_user WHERE username=%s OR lower(email)=%s ORDER BY (username=%s) DESC", (login, login, login)).fetchall()
+    row = next((r for r in rows if rowmac.verify_row("idp_user", r)), None)        # a row without a valid MAC is as good as absent
     ok = passwords.verify_password(password or "", row["password_hash"] if row and row["password_hash"] else _DUMMY)
     if not row or not row["password_hash"] or not ok or row["status"] != "active":
         return None
@@ -116,7 +126,8 @@ def authenticate(conn, login: str, password: str) -> dict | None:
 
 
 def delete(conn, user_id: str) -> None:
-    get(conn, user_id)
+    if not conn.execute("SELECT 1 FROM idp_user WHERE id=%s", (user_id,)).fetchone():     # a row with a bad MAC can still be deleted
+        raise NotFound("no such user")
     conn.execute("DELETE FROM idp_role_grant WHERE subject_type='user' AND subject_id=%s", (user_id,))
     conn.execute("DELETE FROM idp_user WHERE id=%s", (user_id,))
     conn.commit()
@@ -156,7 +167,9 @@ def delete_group(conn, name: str) -> None:
 
 
 def add_to_group(conn, user_id: str, group: str) -> None:
-    conn.execute("INSERT INTO idp_membership (user_id, group_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (user_id, _group_id(conn, group)))
+    gid = _group_id(conn, group)
+    conn.execute("INSERT INTO idp_membership (user_id, group_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (user_id, gid))
+    rowmac.seal(conn, "idp_membership", "user_id=%s AND group_id=%s", (user_id, gid))        # every MAC'd field is the key: nothing else to legitimise
 
 
 def remove_from_group(conn, user_id: str, group: str) -> None:
@@ -167,8 +180,8 @@ def remove_from_group(conn, user_id: str, group: str) -> None:
 # ---- role grants -------------------------------------------------------------------------------------------------------
 def grant_role(conn, subject_type: str, subject: str, client_id: str, role: str) -> None:
     """`subject` is a user id or a group NAME. The role must be one the app defines."""
-    app = conn.execute("SELECT roles FROM idp_app WHERE client_id=%s", (client_id,)).fetchone()
-    if not app:
+    app = conn.execute("SELECT * FROM idp_app WHERE client_id=%s", (client_id,)).fetchone()
+    if not app or not rowmac.verify_row("idp_app", app):
         raise NotFound("no such app")
     if role not in {r["name"] for r in app["roles"]}:
         raise UserError(f"{client_id} does not define a role called {role!r}")
@@ -181,6 +194,7 @@ def grant_role(conn, subject_type: str, subject: str, client_id: str, role: str)
         raise UserError("subject_type must be user or group")
     conn.execute("INSERT INTO idp_role_grant (subject_type, subject_id, client_id, role) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                  (subject_type, sid, client_id, role))
+    rowmac.seal(conn, "idp_role_grant", "subject_type=%s AND subject_id=%s AND client_id=%s AND role=%s", (subject_type, sid, client_id, role))
     conn.commit()
 
 
@@ -191,17 +205,28 @@ def revoke_role(conn, grant_id: int) -> bool:
 
 
 def grants(conn, client_id: str | None = None) -> list[dict]:
-    rows = conn.execute("SELECT r.id, r.subject_type, r.subject_id, r.client_id, r.role, r.created_at, "
+    rows = conn.execute("SELECT r.*, "
                         "CASE r.subject_type WHEN 'user' THEN (SELECT username FROM idp_user WHERE id=r.subject_id) "
                         "ELSE (SELECT name FROM idp_group WHERE id::text=r.subject_id) END AS subject_name "
                         "FROM idp_role_grant r WHERE (%s::text IS NULL OR r.client_id=%s) ORDER BY r.client_id, r.role, r.id", (client_id, client_id)).fetchall()
-    return rows
+    out = []
+    for r in rowmac.valid("idp_role_grant", rows):
+        r.pop("mac", None)
+        out.append(r)
+    return out
 
 
 def roles_for(conn, user_id: str, client_id: str) -> list[str]:
-    """The roles a user holds in one app, namespaced `<client_id>:<role>`: direct grants, group grants and the app's default roles."""
-    rows = conn.execute(
-        "SELECT role FROM idp_role_grant WHERE client_id=%s AND ((subject_type='user' AND subject_id=%s) OR (subject_type='group' AND subject_id IN "
-        "(SELECT group_id::text FROM idp_membership WHERE user_id=%s))) UNION SELECT unnest(default_roles) FROM idp_app WHERE client_id=%s",
-        (client_id, user_id, user_id, client_id)).fetchall()
-    return sorted(f"{client_id}:{r['role']}" for r in rows)
+    """The roles a user holds in one app, namespaced `<client_id>:<role>`: direct grants, group grants and the app's default roles.
+    Only rows with a valid MAC count: the app, the memberships and the grants (a planted row grants nothing)."""
+    app = conn.execute("SELECT * FROM idp_app WHERE client_id=%s", (client_id,)).fetchone()
+    if not app or not rowmac.verify_row("idp_app", app):
+        return []
+    groups = {str(m["group_id"]) for m in conn.execute("SELECT * FROM idp_membership WHERE user_id=%s", (user_id,)).fetchall()
+              if rowmac.verify_row("idp_membership", m)}
+    roles = set(app["default_roles"])
+    for g in conn.execute("SELECT * FROM idp_role_grant WHERE client_id=%s", (client_id,)).fetchall():
+        if ((g["subject_type"] == "user" and g["subject_id"] == user_id) or (g["subject_type"] == "group" and g["subject_id"] in groups)) \
+                and rowmac.verify_row("idp_role_grant", g):
+            roles.add(g["role"])
+    return sorted(f"{client_id}:{r}" for r in roles)

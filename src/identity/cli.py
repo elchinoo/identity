@@ -9,7 +9,7 @@ from apgkit import sealed as sealing
 from apgkit.auth.schema import SQL as AUTH_SQL
 from apgkit.vault import VaultError
 
-from . import audit, core, hardening, keys
+from . import audit, core, hardening, keys, rowmac
 
 
 def run_migrations() -> list[str]:
@@ -86,6 +86,32 @@ def _rotate_vault_key(args) -> int:
     return 0
 
 
+def _adopt_rowmacs(args) -> int:
+    """Sign every security-relevant row that has no MAC (a database that existed before row MACs). It TRUSTS THE DATABASE AS IT IS AT THIS
+    MOMENT: run it on a database you believe untampered, once, after migrating. Asks for the admin password like rotate-vault-key."""
+    with core.db.connect() as conn:
+        password = None
+        if core.vault.has_password_wrap(conn) and not core.vault.is_unlocked():
+            path = os.environ.get("IDENTITY_ADMIN_PASSWORD_FILE")
+            password = Path(path).read_text().rstrip("\n") if path else getpass.getpass("Admin password: ")
+        core.vault.try_unlock_with_platform_secret(conn)
+        try:
+            if not core.vault.is_unlocked() and password is not None:
+                core.vault.unlock_with_password(conn, password)
+        except VaultError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+        if not core.vault.is_unlocked():
+            print("the vault is locked: the admin password is wrong, or set IDENTITY_ENCRYPTION_KEY for this command", file=sys.stderr)
+            return 1
+        counts = rowmac.adopt(conn)
+        audit.log(conn, "cli", "rowmacs_adopted", "", **counts)
+        conn.commit()
+    print("signed rows without a MAC: " + ", ".join(f"{t} {n}" for t, n in counts.items()) +
+          ". This trusted the database as it was now; rows written by anything else from here on are ignored.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="identity")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -98,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     rk.add_argument("--reason", default="", help="recorded in the audit log")
     rv = sub.add_parser("rotate-vault-key", help="replace the vault data key and re-encrypt every stored secret (asks for the admin password)")
     rv.add_argument("--yes", action="store_true", help="required: confirms the rotation")
+    sub.add_parser("adopt-rowmacs", help="sign existing rows that have no row MAC (trusts the database as it is now; asks for the admin password)")
     sub.add_parser("reset-admin", help="forget the admin password and vault (recovery)")
     args = p.parse_args(argv)
     if args.cmd == "migrate":
@@ -128,13 +155,18 @@ def main(argv: list[str] | None = None) -> int:
         return _rotate_keys(args)
     elif args.cmd == "rotate-vault-key":
         return _rotate_vault_key(args)
+    elif args.cmd == "adopt-rowmacs":
+        return _adopt_rowmacs(args)
     elif args.cmd == "reset-admin":
         with core.db.connect() as conn:
             core.local.reset_admin(conn)
             conn.execute("DELETE FROM signing_key")
             conn.execute("UPDATE federation_provider SET enabled=false")
+            for table in rowmac.TABLES:                       # the old data key is gone: no MAC can verify any more, `adopt-rowmacs` signs afresh
+                conn.execute(f"UPDATE {table} SET mac=NULL")  # noqa: S608
             conn.commit()
-        print("admin password and vault cleared, signing keys and federation secrets discarded; the setup code flow is active again")
+        print("admin password and vault cleared, signing keys and federation secrets discarded; the setup code flow is active again. "
+              "Row MACs were under the old data key: after setting the new admin password run `identity adopt-rowmacs` to sign the remaining rows")
     return 0
 
 

@@ -20,6 +20,8 @@ Report vulnerabilities privately (GitHub: Security tab, "Report a vulnerability"
 
 ## Limits
 
+Row MACs bind users, apps, grants, memberships, signing keys, codes, refresh tokens and federation settings to the vault data key, so a database write without that key cannot forge or widen anything; see the README section "Row MACs" for what is covered, the limits (replay of an older authentic row, deletion, denial of service) and `identity adopt-rowmacs` for existing databases.
+
 Grants made after startup (`agentpg db-users create`, default privileges) reopen tables to the read-only database role, `signing_key` included; the app re-asserts the REVOKEs every 5 minutes (gauge `masking_drift_tables`, `masking` in `/readyz`), so a table can be readable for up to one interval.
 
 Stored secrets are bound to their row, and the vault data key can be replaced at any time (`identity rotate-vault-key --yes`, or `POST /api/vault/rotate-key`, both needing the admin password); restart other replicas afterwards. Federated sign-in is tied to the browser that started it by a single-use binding cookie; the static admin key must be at least 32 characters; `IDENTITY_ALLOW_ANONYMOUS` works only on a loopback bind address; set `IDENTITY_FORWARDED_ALLOW_IPS` to the proxy's address (never `*`).

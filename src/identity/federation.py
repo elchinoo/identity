@@ -21,7 +21,7 @@ from apgkit.auth.oidc import TokenError, _client_factory
 from apgkit.auth.rp import LoginStart, RelyingParty
 from psycopg.types.json import Jsonb  # noqa: F401  (kept for providers that later store raw profiles)
 
-from . import core, users
+from . import core, rowmac, users
 from .ids import new_user_id
 
 GOOGLE_ISSUER = "https://accounts.google.com"
@@ -39,7 +39,8 @@ class FederationError(Exception):
 
 
 def list_providers(conn) -> list[dict]:
-    return conn.execute("SELECT provider, client_id, enabled, mode, allowed_domains, default_groups FROM federation_provider ORDER BY provider").fetchall()
+    rows = rowmac.valid("federation_provider", conn.execute("SELECT * FROM federation_provider ORDER BY provider").fetchall())
+    return [{k: r[k] for k in ("provider", "client_id", "enabled", "mode", "allowed_domains", "default_groups")} for r in rows]
 
 
 def enabled(conn) -> list[dict]:
@@ -63,7 +64,9 @@ def upsert_provider(conn, provider: str, client_id: str, client_secret: str | No
             raise FederationError(f"no such group: {g}")
     if not client_id.strip():
         raise FederationError("client id is required")
-    existing = conn.execute("SELECT client_secret_enc FROM federation_provider WHERE provider=%s", (provider,)).fetchone()
+    existing = conn.execute("SELECT * FROM federation_provider WHERE provider=%s", (provider,)).fetchone()
+    if not rowmac.verify_row("federation_provider", existing):         # a planted or edited row is replaced, never adopted
+        existing = None
     if client_secret:
         if not core.vault.is_initialized(conn):
             raise FederationError("set an admin password first: the provider secret is stored encrypted under it")
@@ -77,6 +80,7 @@ def upsert_provider(conn, provider: str, client_id: str, client_secret: str | No
         "ON CONFLICT (provider) DO UPDATE SET client_id=EXCLUDED.client_id, client_secret_enc=EXCLUDED.client_secret_enc, enabled=EXCLUDED.enabled, "
         "mode=EXCLUDED.mode, allowed_domains=EXCLUDED.allowed_domains, default_groups=EXCLUDED.default_groups",
         (provider, client_id.strip(), enc, enabled, mode, domains, groups))
+    rowmac.seal(conn, "federation_provider", "provider=%s", (provider,))
     conn.commit()
     return next(p for p in list_providers(conn) if p["provider"] == provider)
 
@@ -89,7 +93,7 @@ def delete_provider(conn, provider: str) -> None:
 
 def _config(conn, provider: str) -> dict:
     row = conn.execute("SELECT * FROM federation_provider WHERE provider=%s AND enabled", (provider,)).fetchone()
-    if not row:
+    if not row or not rowmac.verify_row("federation_provider", row):
         raise FederationError("that sign-in method is not enabled")
     return row
 
@@ -108,8 +112,8 @@ def _secret(conn, cfg: dict) -> str:
     ctx = core.CTX_PROVIDER_SECRET.format(provider=cfg["provider"])
     plain = core.vault.decrypt(cfg["client_secret_enc"], ctx)
     if core.vault.is_legacy(cfg["client_secret_enc"]):
-        conn.execute("UPDATE federation_provider SET client_secret_enc=%s WHERE provider=%s AND client_secret_enc=%s",
-                     (core.vault.encrypt(plain, ctx), cfg["provider"], cfg["client_secret_enc"]))
+        rowmac.update(conn, "federation_provider", "client_secret_enc=%s", (core.vault.encrypt(plain, ctx),),
+                      "provider=%s AND client_secret_enc=%s", (cfg["provider"], cfg["client_secret_enc"]))
         conn.commit()
     return plain
 
@@ -189,10 +193,12 @@ def finish(conn, provider: str, base_url: str, code: str, state: str, binding: s
 def resolve(conn, cfg: dict, provider: str, claims: dict) -> dict:
     subject, email = str(claims["sub"]), (claims.get("email") or "").strip().lower()
     verified = bool(claims.get("email_verified"))
-    linked = conn.execute("SELECT user_id FROM idp_federated WHERE provider=%s AND subject=%s", (provider, subject)).fetchone()
+    linked = conn.execute("SELECT * FROM idp_federated WHERE provider=%s AND subject=%s", (provider, subject)).fetchone()
+    if not rowmac.verify_row("idp_federated", linked):                 # a planted or edited link is as good as none
+        linked = None
     user_id = linked["user_id"] if linked else None
     if user_id is None and email and verified:
-        match = conn.execute("SELECT id FROM idp_user WHERE lower(email)=%s", (email,)).fetchone()
+        match = next((r for r in conn.execute("SELECT * FROM idp_user WHERE lower(email)=%s", (email,)).fetchall() if rowmac.verify_row("idp_user", r)), None)
         if match:
             user_id = match["id"]
     if user_id is None and email and verified and cfg["mode"] == "open" and email.rsplit("@", 1)[-1] in cfg["allowed_domains"]:
@@ -203,14 +209,18 @@ def resolve(conn, cfg: dict, provider: str, claims: dict) -> dict:
             username = f"{base[:55]}{n}"
         user_id = new_user_id()
         conn.execute("INSERT INTO idp_user (id, username, email, name) VALUES (%s,%s,%s,%s)", (user_id, username, email, str(claims.get("name") or "")[:120]))
+        rowmac.seal(conn, "idp_user", "id=%s", (user_id,))
         for g in cfg["default_groups"]:
             users.add_to_group(conn, user_id, g)
     if user_id is None:
         raise FederationError("there is no account for this identity here. Ask an administrator to create one for your e-mail address.")
-    row = conn.execute("SELECT id, status FROM idp_user WHERE id=%s", (user_id,)).fetchone()
-    if not row or row["status"] != "active":
+    row = conn.execute("SELECT * FROM idp_user WHERE id=%s", (user_id,)).fetchone()
+    if not rowmac.verify_row("idp_user", row) or row["status"] != "active":
         raise FederationError("this account is disabled")
-    conn.execute("INSERT INTO idp_federated (provider, subject, user_id, email) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING", (provider, subject, user_id, email))
+    if linked is None:
+        conn.execute("DELETE FROM idp_federated WHERE provider=%s AND subject=%s", (provider, subject))      # only an unverified row can be here
+        conn.execute("INSERT INTO idp_federated (provider, subject, user_id, email) VALUES (%s,%s,%s,%s)", (provider, subject, user_id, email))
+        rowmac.seal(conn, "idp_federated", "provider=%s AND subject=%s", (provider, subject))
     conn.execute("UPDATE idp_user SET last_login_at = now() WHERE id=%s", (user_id,))
     conn.commit()
     return users.get(conn, user_id)

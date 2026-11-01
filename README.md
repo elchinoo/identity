@@ -69,6 +69,43 @@ an ephemeral in-process key, `ecoctl unseal`); Identity then opens the blob, app
 same passphrase (the signing keys stay wrapped under that passphrase alone; `IDENTITY_ENCRYPTION_KEY` is ignored) and serves. After a
 restart it is sealed again. With no `APGKIT_SEALED` nothing changes.
 
+## Row MACs
+
+A database WRITE alone (no vault data key) must not forge identities, widen privileges, redirect codes or publish attacker signing keys. Every
+security-relevant row carries a `mac`: an HMAC-SHA256 under a subkey of the vault data key (agentpg-kit `Vault.row_mac`) over the fields that
+matter, written in the same transaction as the change.
+
+| Table | Fields covered |
+| --- | --- |
+| `idp_user` | id, username, email, password_hash, status |
+| `idp_federated` | provider, subject, user_id |
+| `idp_membership` | user_id, group_id |
+| `idp_app` | client_id, kind, secret_hash, redirect_uris, post_logout_uris, allowed_scopes, allowed_audiences, roles, default_roles |
+| `idp_role_grant` | subject_type, subject_id, client_id, role |
+| `signing_key` | kid, alg, public_jwk, status, retire_at |
+| `oauth_code` | code_hash, client_id, user_id, redirect_uri, scope, nonce, code_challenge, auth_time, expires_at |
+| `oauth_refresh` | token_hash, family_id, client_id, user_id, scope, auth_time, expires_at, used_at, revoked_at |
+| `federation_provider` | provider, client_id, client_secret_enc, enabled, mode, allowed_domains, default_groups |
+
+Every read that feeds a sign-in or token decision (user lookup at login, client lookup, role resolution, code and refresh redemption,
+signing-key selection and the published JWKS, federation settings) verifies the MAC, and a missing or wrong MAC is treated exactly like a
+missing row. A refused row is logged (table and primary key only), counted in `idp_tampered_rows_total{table=...}` and audited once per row
+per process (`row_mac_invalid`). With the vault locked nothing can be verified, so those lookups fail closed (token requests answer 503;
+`/jwks.json` keeps serving only the set this process verified earlier, nothing after a cold start). Rotating the vault data key changes every
+MAC; `identity rotate-vault-key` re-signs the rows that verified before it.
+
+Limits:
+
+- A copied older authentic row (with its MAC) can be replayed from a backup: the MAC proves the row was written by Identity, not that it is current.
+- Deleting rows is still possible (a deleted grant, user or key simply stops existing).
+- Unsigned rows are ignored, so the worst an attacker's database write can do is deny service (a user, app or key that stops working until an operator repairs it).
+- Columns outside the lists above (display name, description, URLs, timestamps such as `last_login_at`) are not covered.
+
+Existing databases: after upgrading and migrating (`002_rowmac`), run `identity adopt-rowmacs`. It asks for the admin password (or reads
+`IDENTITY_ADMIN_PASSWORD_FILE`, or uses `IDENTITY_ENCRYPTION_KEY`), signs every row that has no MAC and prints the counts per table. **It trusts
+the database as it is at that moment**: run it once, on a database you believe untampered. Until then those rows are ignored (nobody can sign in).
+Fresh databases need nothing. After `identity reset-admin` (new vault, new data key) run it again.
+
 ## Documentation
 
 The complete guide is [docs/GUIDE.md](docs/GUIDE.md): how Identity fits the ecosystem, architecture, install, every setting,

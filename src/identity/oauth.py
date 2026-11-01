@@ -35,7 +35,7 @@ from authlib.oauth2.rfc9068 import JWTBearerTokenGenerator
 from authlib.oidc.core.grants import OpenIDCode
 from joserfc import jwt
 
-from . import core, keys, users
+from . import core, keys, rowmac, users
 from .apps import STANDARD_SCOPES
 
 ACCESS_TTL = 600            # seconds: short, so a disabled user or revoked role bites quickly
@@ -214,6 +214,7 @@ class CodeGrant(ScopePolicy, AuthorizationCodeGrant):
                          (sha256(code), request.client.get_client_id(), request.user["id"], request.payload.redirect_uri,
                           request.scope or "", data.get("nonce"), data["code_challenge"], "S256", request.user.get("auth_time", int(time.time())),
                           datetime.now(UTC) + timedelta(seconds=CODE_TTL)))
+            rowmac.seal(conn, "oauth_code", "code_hash=%s", (sha256(code),))
             conn.commit()
 
     def query_authorization_code(self, code, client):
@@ -222,7 +223,7 @@ class CodeGrant(ScopePolicy, AuthorizationCodeGrant):
             row = conn.execute("DELETE FROM oauth_code WHERE code_hash=%s AND client_id=%s AND expires_at > now() RETURNING *",
                                (sha256(code), client.get_client_id())).fetchone()
             conn.commit()
-        return AuthCode(row) if row else None
+        return AuthCode(row) if row and rowmac.verify_row("oauth_code", row) else None          # a planted or edited code is as good as none
 
     def delete_authorization_code(self, authorization_code):
         with core.db.connect(retries=1) as conn:
@@ -231,8 +232,8 @@ class CodeGrant(ScopePolicy, AuthorizationCodeGrant):
 
     def authenticate_user(self, authorization_code):
         with core.db.connect(retries=1) as conn:
-            row = conn.execute("SELECT id, username, email, name, status FROM idp_user WHERE id=%s", (authorization_code.user_id,)).fetchone()
-        return User(row, authorization_code.client_id) if row and row["status"] == "active" else None
+            row = conn.execute("SELECT * FROM idp_user WHERE id=%s", (authorization_code.user_id,)).fetchone()
+        return User(row, authorization_code.client_id) if rowmac.verify_row("idp_user", row) and row["status"] == "active" else None
 
 
 class RefreshGrant(ScopePolicy, RefreshTokenGrant):
@@ -242,11 +243,11 @@ class RefreshGrant(ScopePolicy, RefreshTokenGrant):
     def authenticate_refresh_token(self, refresh_token):
         with core.db.connect(retries=1) as conn:
             row = conn.execute("SELECT * FROM oauth_refresh WHERE token_hash=%s", (sha256(refresh_token),)).fetchone()
-            if not row:
+            if not rowmac.verify_row("oauth_refresh", row):               # absent, planted or edited
                 return None
             if row["used_at"] is not None or row["revoked_at"] is not None:
                 # a token that was already used (or revoked) is being presented again: assume theft and kill the whole family
-                conn.execute("UPDATE oauth_refresh SET revoked_at = now() WHERE family_id=%s AND revoked_at IS NULL", (row["family_id"],))
+                rowmac.update(conn, "oauth_refresh", "revoked_at = now()", (), "family_id=%s AND revoked_at IS NULL", (row["family_id"],))
                 conn.commit()
                 return None
         rec = RefreshRecord(row)
@@ -254,18 +255,20 @@ class RefreshGrant(ScopePolicy, RefreshTokenGrant):
 
     def authenticate_user(self, refresh_token):
         with core.db.connect(retries=1) as conn:
-            row = conn.execute("SELECT id, username, email, name, status FROM idp_user WHERE id=%s", (refresh_token.user_id,)).fetchone()
-        return User(row, refresh_token.client_id) if row and row["status"] == "active" else None
+            row = conn.execute("SELECT * FROM idp_user WHERE id=%s", (refresh_token.user_id,)).fetchone()
+        return User(row, refresh_token.client_id) if rowmac.verify_row("idp_user", row) and row["status"] == "active" else None
 
     def create_token_response(self):
         """Claim the presented token first: the conditional UPDATE is the single-use gate. A concurrent second request with the same
         token gets no row back, is treated as reuse, and the whole family is revoked."""
         record = self.request.refresh_token
         with core.db.connect(retries=1) as conn:
-            claimed = conn.execute("UPDATE oauth_refresh SET used_at = now() WHERE id=%s AND used_at IS NULL AND revoked_at IS NULL RETURNING id",
-                                   (record.row["id"],)).fetchone()
-            if not claimed:
-                conn.execute("UPDATE oauth_refresh SET revoked_at = now() WHERE family_id=%s AND revoked_at IS NULL", (record.family_id,))
+            current = conn.execute("SELECT * FROM oauth_refresh WHERE id=%s FOR UPDATE", (record.row["id"],)).fetchone()       # row lock: one claimant at a time
+            claimed = bool(current and current["used_at"] is None and current["revoked_at"] is None and rowmac.verify_row("oauth_refresh", current))
+            if claimed:
+                rowmac.update(conn, "oauth_refresh", "used_at = now()", (), "id=%s", (record.row["id"],))
+            else:
+                rowmac.update(conn, "oauth_refresh", "revoked_at = now()", (), "family_id=%s AND revoked_at IS NULL", (record.family_id,))
             conn.commit()
         if not claimed:
             raise InvalidGrantError("Invalid 'refresh_token' in request.")
@@ -367,11 +370,11 @@ class _Revocation(RevocationEndpoint):
     def query_token(self, token_string, token_type_hint):
         with core.db.connect(retries=1) as conn:
             row = conn.execute("SELECT * FROM oauth_refresh WHERE token_hash=%s", (sha256(token_string),)).fetchone()
-        return RefreshRecord(row) if row else None
+        return RefreshRecord(row) if rowmac.verify_row("oauth_refresh", row) else None
 
     def revoke_token(self, token, request):
         with core.db.connect(retries=1) as conn:
-            conn.execute("UPDATE oauth_refresh SET revoked_at = now() WHERE family_id=%s AND revoked_at IS NULL", (token.family_id,))
+            rowmac.update(conn, "oauth_refresh", "revoked_at = now()", (), "family_id=%s AND revoked_at IS NULL", (token.family_id,))
             conn.commit()
 
 
@@ -381,7 +384,7 @@ class _Introspection(IntrospectionEndpoint):
     def query_token(self, token_string, token_type_hint):
         with core.db.connect(retries=1) as conn:
             row = conn.execute("SELECT * FROM oauth_refresh WHERE token_hash=%s", (sha256(token_string),)).fetchone()
-        return RefreshRecord(row) if row else None
+        return RefreshRecord(row) if rowmac.verify_row("oauth_refresh", row) else None
 
     def check_permission(self, token, client, request):
         return token.client_id == client.get_client_id()
@@ -408,7 +411,7 @@ class IdentityServer(AuthorizationServer):
     def query_client(self, client_id):
         with core.db.connect(retries=1) as conn:
             row = conn.execute("SELECT * FROM idp_app WHERE client_id=%s AND status='active'", (client_id,)).fetchone()
-        return Client(row) if row else None
+        return Client(row) if rowmac.verify_row("idp_app", row) else None          # edited redirect URIs / secret / audiences: no such client
 
     def save_token(self, token, request):
         if not token.get("refresh_token"):
@@ -425,6 +428,7 @@ class IdentityServer(AuthorizationServer):
             conn.execute("INSERT INTO oauth_refresh (token_hash, family_id, client_id, user_id, scope, auth_time, expires_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
                          (sha256(token["refresh_token"]), family, request.client.get_client_id(), user.get_user_id(), token.get("scope", ""),
                           auth_time, datetime.now(UTC) + timedelta(seconds=refresh_ttl())))
+            rowmac.seal(conn, "oauth_refresh", "token_hash=%s", (sha256(token["refresh_token"]),))
             conn.commit()
 
     def create_oauth2_request(self, request):

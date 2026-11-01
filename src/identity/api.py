@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, apps, audit, cli, core, federation, hardening, keys, oauth, users
+from . import __version__, apps, audit, cli, core, federation, hardening, keys, oauth, rowmac, users
 from .core import COOKIE_ADMIN, COOKIE_SSO, CSRF_HEADER, auth, db, local, login_limiter, metrics, vault
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -164,8 +164,10 @@ def sso_user(request: Request) -> dict | None:
         p = local.session_principal(conn, raw)
         if not p or p.source != "idp":
             return None
-        row = conn.execute("SELECT id, username, email, name, status FROM idp_user WHERE id=%s", (p.subject,)).fetchone()
-    return row if row and row["status"] == "active" else None
+        row = conn.execute("SELECT * FROM idp_user WHERE id=%s", (p.subject,)).fetchone()
+    if not rowmac.verify_row("idp_user", row) or row["status"] != "active":
+        return None
+    return {k: row[k] for k in ("id", "username", "email", "name", "status")}
 
 
 def start_sso(conn, request: Request, response: Response, user: dict) -> None:
@@ -270,7 +272,8 @@ def my_apps(request: Request):
         raise HTTPException(401, "sign in first")
     with db.connect() as conn:
         out = []
-        for a in conn.execute("SELECT client_id, name, description, url FROM idp_app WHERE status='active' AND url <> '' AND kind <> 'service' ORDER BY name").fetchall():
+        for a in rowmac.valid("idp_app", conn.execute("SELECT * FROM idp_app WHERE status='active' AND url <> '' AND kind <> 'service' ORDER BY name").fetchall()):
+            a = {k: a[k] for k in ("client_id", "name", "description", "url")}
             roles = users.roles_for(conn, user["id"], a["client_id"])
             if roles:
                 out.append({**a, "roles": [r.split(":", 1)[1] for r in roles]})
@@ -329,6 +332,8 @@ async def token(request: Request):
 
     def run():
         try:
+            if not vault.is_unlocked():                         # row MACs cannot be checked (clients, codes, tokens), so nothing is issued
+                raise RuntimeError("the vault is locked")
             status, body, headers = server.create_token_response(request=oreq)
         except (RuntimeError, vault_mod.VaultError) as exc:      # no signing key available (the vault is locked)
             return JSONResponse({"error": "temporarily_unavailable", "error_description": "tokens cannot be signed right now: " + str(exc)[:120]},
@@ -378,8 +383,8 @@ def end_session(request: Request, response: Response, post_logout_redirect_uri: 
                 cid = cid[0] if isinstance(cid, list) else cid
         if cid:
             with db.connect(retries=1) as conn:
-                row = conn.execute("SELECT post_logout_uris FROM idp_app WHERE client_id=%s", (cid,)).fetchone()
-            if row and post_logout_redirect_uri in row["post_logout_uris"]:
+                row = conn.execute("SELECT * FROM idp_app WHERE client_id=%s", (cid,)).fetchone()
+            if rowmac.verify_row("idp_app", row) and post_logout_redirect_uri in row["post_logout_uris"]:
                 target = post_logout_redirect_uri + (("&" if "?" in post_logout_redirect_uri else "?") + urlencode({"state": state}) if state else "")
     with db.connect(retries=1) as conn:
         local.delete_session(conn, request.cookies.get(COOKIE_SSO))

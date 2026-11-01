@@ -7,6 +7,8 @@ import psycopg
 from apgkit.ids import sha256
 from psycopg.types.json import Jsonb
 
+from . import rowmac
+
 CLIENT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
 ROLE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
 SCOPE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,59}$")
@@ -80,21 +82,24 @@ def register(conn, client_id: str, name: str, kind: str, spec: dict) -> tuple[di
     except psycopg.errors.UniqueViolation as exc:
         conn.rollback()
         raise AppError("an app with that client id already exists") from exc
+    rowmac.seal(conn, "idp_app", "client_id=%s", (client_id,))
     conn.commit()
     return get(conn, client_id), secret
 
 
 def get(conn, client_id: str) -> dict:
-    row = conn.execute("SELECT client_id, name, description, kind, redirect_uris, post_logout_uris, allowed_scopes, allowed_audiences, roles, "
-                       "default_roles, url, status, created_at FROM idp_app WHERE client_id=%s", (client_id,)).fetchone()
-    if not row:
+    row = conn.execute("SELECT * FROM idp_app WHERE client_id=%s", (client_id,)).fetchone()
+    if not row or not rowmac.verify_row("idp_app", row):
         raise NotFound("no such app")
+    row.pop("secret_hash", None)
+    row.pop("mac", None)
     return row
 
 
 def listing(conn) -> list[dict]:
-    return conn.execute("SELECT client_id, name, kind, url, status, jsonb_array_length(roles) AS roles, "
-                        "(SELECT count(*) FROM idp_role_grant g WHERE g.client_id=a.client_id) AS grants FROM idp_app a ORDER BY name").fetchall()
+    rows = conn.execute("SELECT a.*, (SELECT count(*) FROM idp_role_grant g WHERE g.client_id=a.client_id) AS grants FROM idp_app a ORDER BY name").fetchall()
+    return [{"client_id": r["client_id"], "name": r["name"], "kind": r["kind"], "url": r["url"], "status": r["status"], "roles": len(r["roles"]),
+             "grants": r["grants"]} for r in rowmac.valid("idp_app", rows)]
 
 
 def update(conn, client_id: str, spec: dict) -> dict:
@@ -105,14 +110,15 @@ def update(conn, client_id: str, spec: dict) -> dict:
     status = spec.get("status", cur["status"])
     if status not in {"active", "disabled"}:
         raise AppError("status must be active or disabled")
-    conn.execute("UPDATE idp_app SET name=%s, description=%s, redirect_uris=%s, post_logout_uris=%s, allowed_scopes=%s, allowed_audiences=%s, "
-                 "roles=%s, default_roles=%s, url=%s, status=%s WHERE client_id=%s",
-                 (str(spec.get("name", cur["name"]))[:80], str(spec.get("description", cur["description"]))[:300], c["redirect_uris"],
-                  c["post_logout_uris"], c["allowed_scopes"], c["allowed_audiences"], Jsonb(c["roles"]), c["default_roles"], c["url"], status, client_id))
+    rowmac.update(conn, "idp_app", "name=%s, description=%s, redirect_uris=%s, post_logout_uris=%s, allowed_scopes=%s, allowed_audiences=%s, "
+                  "roles=%s, default_roles=%s, url=%s, status=%s",
+                  (str(spec.get("name", cur["name"]))[:80], str(spec.get("description", cur["description"]))[:300], c["redirect_uris"],
+                   c["post_logout_uris"], c["allowed_scopes"], c["allowed_audiences"], Jsonb(c["roles"]), c["default_roles"], c["url"], status),
+                  "client_id=%s", (client_id,))
     # a role removed from the catalog loses its grants
     conn.execute("DELETE FROM idp_role_grant WHERE client_id=%s AND NOT (role = ANY(%s))", (client_id, [r["name"] for r in c["roles"]]))
     if status == "disabled":
-        conn.execute("UPDATE oauth_refresh SET revoked_at = now() WHERE client_id=%s AND revoked_at IS NULL", (client_id,))
+        rowmac.update(conn, "oauth_refresh", "revoked_at = now()", (), "client_id=%s AND revoked_at IS NULL", (client_id,))
     conn.commit()
     return get(conn, client_id)
 
@@ -122,12 +128,12 @@ def rotate_secret(conn, client_id: str) -> str:
     if app["kind"] == "public":
         raise AppError("a public client has no secret")
     secret = "cs_" + secrets.token_urlsafe(32)
-    conn.execute("UPDATE idp_app SET secret_hash=%s WHERE client_id=%s", (sha256(secret), client_id))
+    rowmac.update(conn, "idp_app", "secret_hash=%s", (sha256(secret),), "client_id=%s", (client_id,))
     conn.commit()
     return secret
 
 
 def delete(conn, client_id: str) -> None:
-    get(conn, client_id)
-    conn.execute("DELETE FROM idp_app WHERE client_id=%s", (client_id,))
+    if not conn.execute("DELETE FROM idp_app WHERE client_id=%s RETURNING 1", (client_id,)).fetchone():     # also removes a row whose MAC is bad
+        raise NotFound("no such app")
     conn.commit()

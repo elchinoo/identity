@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from joserfc.jwk import RSAKey
 from psycopg.types.json import Jsonb
 
-from . import audit, core
+from . import audit, core, rowmac
 from .ids import new_kid
 
 RETIRE_AFTER = timedelta(hours=24)
@@ -19,6 +19,7 @@ _cache: dict = {"kid": None, "key": None, "at": 0.0}
 # Another replica may rotate the key. A process re-reads which key is active from the database at most this often, so it
 # follows a rotation made elsewhere within CACHE_TTL seconds (the rotated-out key stays published for 24 hours, so nothing breaks).
 CACHE_TTL = 30.0
+_jwks_seen: dict = {"keys": []}                              # the last published set whose MACs all verified (used only while the vault is locked)
 _now = time.monotonic                                       # tests replace this
 
 
@@ -26,10 +27,20 @@ def _generate(kid: str) -> RSAKey:
     return RSAKey.generate_key(2048, {"kid": kid, "use": "sig", "alg": "RS256"})
 
 
+def _active(conn) -> dict | None:
+    """The newest active key whose MAC verifies (a planted or edited row is as good as absent), or None."""
+    for row in conn.execute("SELECT * FROM signing_key WHERE status='active' ORDER BY created_at DESC").fetchall():
+        if rowmac.verify_row("signing_key", row):
+            return row
+    return None
+
+
 def ensure(conn) -> str | None:
     """Make sure an active key exists. Needs the vault unlocked; returns the active kid or None when locked."""
-    row = conn.execute("SELECT kid FROM signing_key WHERE status='active' ORDER BY created_at DESC LIMIT 1").fetchone()
+    row = _active(conn)
     if row:
+        if not _jwks_seen["keys"]:
+            jwks(conn)                                         # remember what verifies, to keep publishing it if the vault is later locked
         return row["kid"]
     if not core.vault.is_unlocked():
         return None
@@ -39,14 +50,24 @@ def ensure(conn) -> str | None:
 def rotate(conn, first: bool = False) -> str:
     kid = new_kid()
     key = _generate(kid)
-    conn.execute("UPDATE signing_key SET status='retiring', retire_at=%s WHERE status='active'", (datetime.now(UTC) + RETIRE_AFTER,))
-    conn.execute("INSERT INTO signing_key (kid, alg, private_enc, public_jwk) VALUES (%s,'RS256',%s,%s)",
-                 (kid, core.vault.encrypt(key.as_pem(private=True).decode(), core.CTX_SIGNING_KEY.format(kid=kid)), Jsonb(key.as_dict(private=False))))
-    conn.execute("UPDATE signing_key SET status='retired' WHERE status='retiring' AND retire_at < now()")
+    rowmac.update(conn, "signing_key", "status='retiring', retire_at=%s", (datetime.now(UTC) + RETIRE_AFTER,), "status='active'")
+    _insert(conn, kid, key)
+    _retire_expired(conn)
     conn.commit()
     with _lock:
         _cache.update(kid=None, key=None, at=0.0)
+    jwks(conn)
     return kid
+
+
+def _insert(conn, kid: str, key: RSAKey) -> None:
+    conn.execute("INSERT INTO signing_key (kid, alg, private_enc, public_jwk) VALUES (%s,'RS256',%s,%s)",
+                 (kid, core.vault.encrypt(key.as_pem(private=True).decode(), core.CTX_SIGNING_KEY.format(kid=kid)), Jsonb(key.as_dict(private=False))))
+    rowmac.seal(conn, "signing_key", "kid=%s", (kid,))
+
+
+def _retire_expired(conn) -> None:
+    rowmac.update(conn, "signing_key", "status='retired'", (), "status='retiring' AND retire_at < now()")
 
 
 def emergency_rotate(conn, actor: str = "cli", reason: str = "") -> dict:
@@ -59,9 +80,8 @@ def emergency_rotate(conn, actor: str = "cli", reason: str = "") -> dict:
     key = _generate(kid)
     old = [r["kid"] for r in conn.execute("SELECT kid FROM signing_key").fetchall()]
     conn.execute("DELETE FROM signing_key")
-    conn.execute("INSERT INTO signing_key (kid, alg, private_enc, public_jwk) VALUES (%s,'RS256',%s,%s)",
-                 (kid, core.vault.encrypt(key.as_pem(private=True).decode(), core.CTX_SIGNING_KEY.format(kid=kid)), Jsonb(key.as_dict(private=False))))
-    refresh = conn.execute("UPDATE oauth_refresh SET revoked_at = now() WHERE revoked_at IS NULL").rowcount
+    _insert(conn, kid, key)
+    refresh = rowmac.update(conn, "oauth_refresh", "revoked_at = now()", (), "revoked_at IS NULL")
     codes = conn.execute("DELETE FROM oauth_code").rowcount
     sessions = conn.execute("DELETE FROM web_session WHERE source <> 'local'").rowcount
     detail = {"removed_keys": old, "refresh_tokens_revoked": refresh, "sso_sessions_ended": sessions, "codes_dropped": codes}
@@ -70,6 +90,7 @@ def emergency_rotate(conn, actor: str = "cli", reason: str = "") -> dict:
     audit.log(conn, actor, "signing_key_emergency_rotated", kid, **detail)
     conn.commit()
     forget()
+    jwks(conn)
     return {"kid": kid, **detail}
 
 
@@ -78,8 +99,10 @@ def rotate_vault_key(conn, actor: str, password: str | None) -> dict[str, int]:
     wraps rewritten in one transaction (agentpg-kit `Vault.rotate_data_key`). Needs the vault unlocked and, when an admin password
     exists, that password. Raises `VaultError` (wrong password, locked) without changing anything. Other replicas keep the old key in
     memory until restarted. The audit row carries counts only, never a secret."""
-    conn.commit()                                              # rotate_data_key needs an idle connection
+    snap = rowmac.snapshot(conn)                               # rows that verify under the old key: every MAC changes with the data key
+    conn.rollback()                                            # rotate_data_key needs an idle connection
     counts = core.vault.rotate_data_key(conn, password=password)
+    rowmac.reseal(conn, snap)                                  # signed again under the new key (rows that did not verify stay unsigned)
     audit.log(conn, actor, "vault_key_rotated", "", **counts)
     conn.commit()
     forget()
@@ -91,7 +114,7 @@ def signing_key(conn) -> RSAKey:
     with _lock:
         if _cache["key"] is not None and _now() - _cache["at"] < CACHE_TTL:
             return _cache["key"]
-    row = conn.execute("SELECT kid, private_enc FROM signing_key WHERE status='active' ORDER BY created_at DESC LIMIT 1").fetchone()
+    row = _active(conn)
     if not row:
         raise RuntimeError("no signing key: unlock the vault (sign in as the admin or set IDENTITY_ENCRYPTION_KEY)")
     with _lock:
@@ -115,10 +138,14 @@ def forget() -> None:
 
 
 def jwks(conn) -> dict:
-    conn.execute("UPDATE signing_key SET status='retired' WHERE status='retiring' AND retire_at < now()")
-    rows = conn.execute("SELECT public_jwk FROM signing_key WHERE status IN ('active', 'retiring') ORDER BY created_at DESC").fetchall()
+    if not core.vault.is_unlocked():                           # MACs cannot be checked: serve only what this process last verified (nothing after a cold start)
+        return {"keys": list(_jwks_seen["keys"])}
+    _retire_expired(conn)
+    rows = conn.execute("SELECT * FROM signing_key WHERE status IN ('active', 'retiring') ORDER BY created_at DESC").fetchall()
     conn.commit()
-    return {"keys": [r["public_jwk"] for r in rows]}
+    out = [r["public_jwk"] for r in rowmac.valid("signing_key", rows)]
+    _jwks_seen["keys"] = out
+    return {"keys": out}
 
 
 def list_keys(conn) -> list[dict]:
