@@ -148,12 +148,12 @@ def reseal(conn, snap: dict[str, list]) -> int:
     for token_hash in snap.pop("web_session", []):
         r = conn.execute("SELECT * FROM web_session WHERE token_hash=%s", (token_hash,)).fetchone()
         if r:
-            conn.execute("UPDATE web_session SET mac=%s WHERE token_hash=%s", (core.local._session_mac(
+            conn.execute("UPDATE web_session SET mac=%s WHERE token_hash=%s", (core.local.session_mac(
                 r["token_hash"], r["subject"], r["name"], r["email"], r["roles"], r["source"], r["expires_at"]), token_hash))
     for tid in snap.pop("api_token", []):
         r = conn.execute("SELECT * FROM api_token WHERE id=%s", (tid,)).fetchone()
         if r:
-            conn.execute("UPDATE api_token SET mac=%s WHERE id=%s", (core.local._token_mac(r["id"], r["name"], r["token_hash"], r["prefix"], r["scope"], False), tid))
+            conn.execute("UPDATE api_token SET mac=%s WHERE id=%s", (core.local.token_mac(r["id"], r["name"], r["token_hash"], r["prefix"], r["scope"], False), tid))
     for t, pks in snap.items():
         for pk in pks:
             w, p = _where(t, pk)

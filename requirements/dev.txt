@@ -1,5 +1,5 @@
-agentpg-kit @ https://github.com/elchinoo/agentpg-kit/archive/05ae5e59ef410621c0db627315d42aa544ad5f4b.tar.gz \
-    --hash=sha256:922473068c07d78dd87bfef52942f4fb53f8bda8cbca03ff783532af5e890d13
+agentpg-kit @ https://github.com/elchinoo/agentpg-kit/archive/35f67f73b94fc9a3d006d71427c4b85ac9de1808.tar.gz \
+    --hash=sha256:89f3cd1d36b3813a857395b10a8909a2dbf3f9d10941e99ec423e6af06e65c31
     # via
     #   --override requirements/kit-override.txt
     #   agentpg-identity (pyproject.toml)
