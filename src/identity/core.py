@@ -1,6 +1,7 @@
 """The shared singletons of this app, built from kit blocks."""
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from apgkit import metrics as metrics_mod
 from apgkit.auth import AppAuth, Authenticator, LocalAuth
@@ -92,6 +93,36 @@ def check_encoding(conn) -> None:
 
 def issuer(public_url: str) -> str:
     return (os.environ.get("IDENTITY_ISSUER") or public_url).rstrip("/")
+
+
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def dev_http_relaxed(issuer: str | None = None, flag: bool | None = None) -> bool:
+    """True only when BOTH the configured issuer is http:// on a loopback name (localhost, 127.0.0.1, [::1], *.localhost) AND the explicit
+    development opt-in IDENTITY_DEV_HTTP is on. Decided from configuration alone (IDENTITY_ISSUER, else IDENTITY_PUBLIC_URL), never from
+    request headers; an https issuer, a non-loopback host or a missing flag leaves authlib's https requirement fully in force."""
+    if flag is None:
+        flag = env_bool("IDENTITY_DEV_HTTP")
+    if not flag:
+        return False
+    if issuer is None:
+        issuer = os.environ.get("IDENTITY_ISSUER") or os.environ.get("IDENTITY_PUBLIC_URL") or ""
+    try:
+        parts = urlsplit(issuer.strip())
+        host = (parts.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if parts.scheme != "http" or not host:
+        return False
+    return host in LOOPBACK_HOSTS or host.endswith(".localhost")
+
+
+def oauth_uri(uri: str) -> str:
+    """The URI handed to authlib's transport check: an http:// request is presented as https:// only while the development relaxation is on."""
+    if uri[:7].lower() == "http://" and dev_http_relaxed():
+        return "https://" + uri[7:]
+    return uri
 
 
 MAX_NEXT = 2048

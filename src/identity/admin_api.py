@@ -124,6 +124,7 @@ def build_router(auth, keys_forget) -> APIRouter:
             counts["vault"] = vault.status(conn)
             counts["signing_keys"] = keys.list_keys(conn)
             counts["providers"] = federation.enabled(conn)
+        counts["insecure_transport_relaxed"] = core.dev_http_relaxed()
         return counts
 
     # ---- database insights (EDB edb_stat_monitor / edb_pg_tuner / query_advisor; degrades to "not available" on plain Postgres) ----

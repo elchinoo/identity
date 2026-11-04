@@ -57,6 +57,7 @@ such as `trustdesk`. Scopes address one audience app by their prefix.
 | `IDENTITY_FORWARDED_ALLOW_IPS` | Peers whose `X-Forwarded-*` headers are believed (default `127.0.0.1`; behind a proxy set its address, never `*`). |
 | `IDENTITY_TRUSTED_HOPS` | Proxies in front of the app for the client address used by the rate limits (default 1; 0 = the socket peer). |
 | `IDENTITY_HOST` / `HOST` | Bind address (default `0.0.0.0`). `IDENTITY_ALLOW_ANONYMOUS` is honoured only on loopback, or with `IDENTITY_ALLOW_ANONYMOUS_PUBLIC=1`. |
+| `IDENTITY_DEV_HTTP` | **Local development only, never in production.** Set to `1` to let the OAuth endpoints work over plain `http` on names such as `identity.localhost`. It takes effect only when the configured issuer (`IDENTITY_ISSUER` / `IDENTITY_PUBLIC_URL`) is `http://` on `localhost`, `127.0.0.1`, `[::1]` or `*.localhost`; with an https or non-loopback issuer it does nothing. Logged as a WARNING at start-up and shown as `insecure_transport_relaxed` in `/readyz` and the admin overview. |
 | `IDENTITY_REFRESH_TTL_DAYS` | Refresh token lifetime, 1 to 365 days (default 30). |
 
 ## Sealed boot

@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import logging
 import sys
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from starlette.concurrency import run_in_threadpool
 from . import __version__, apps, audit, cli, core, federation, hardening, keys, oauth, rowmac, users
 from .core import COOKIE_ADMIN, COOKIE_SSO, CSRF_HEADER, auth, db, local, login_limiter, metrics, vault
 
+log = logging.getLogger("identity")
 STATIC = Path(__file__).resolve().parent / "static"
 MASKING_EVERY = 300          # seconds between masking re-asserts (agentpg-kit apgkit.masking.reassert_forever)
 _announced = False
@@ -41,6 +43,8 @@ def _announce() -> None:
 
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
+    if core.dev_http_relaxed():
+        log.warning("development http transport relaxation is ON (IDENTITY_DEV_HTTP with a loopback http issuer): local development only, never in production")
     auth.check_static_key()                    # reads IDENTITY_API_KEY through read_secret: only now, after any unseal
     try:
         with db.connect(retries=2) as conn:
@@ -123,7 +127,9 @@ def readyz():
         with db.connect(retries=1) as conn:
             core.check_encoding(conn)
             ready = keys.can_sign(conn)
-        return {"status": "ready", "masking": masking.status()} if ready else JSONResponse({"status": "locked", "detail": "no signing key: unlock the vault"}, status_code=503)
+        relaxed = core.dev_http_relaxed()
+        return ({"status": "ready", "masking": masking.status(), "insecure_transport_relaxed": relaxed} if ready
+                else JSONResponse({"status": "locked", "detail": "no signing key: unlock the vault", "insecure_transport_relaxed": relaxed}, status_code=503))
     except core.DatabaseEncodingError as exc:
         return JSONResponse({"status": "bad-database-encoding", "detail": str(exc)}, status_code=503)
     except Exception:  # noqa: BLE001
@@ -285,7 +291,7 @@ def _oauth_request(request: Request, data: dict) -> oauth.StarletteRequest:
     headers = {}
     if request.headers.get("authorization"):
         headers["Authorization"] = request.headers["authorization"]
-    return oauth.StarletteRequest(request.method, str(request.url), data, headers)
+    return oauth.StarletteRequest(request.method, core.oauth_uri(str(request.url)), data, headers)
 
 
 def _json(status: int, body, headers) -> JSONResponse:
@@ -295,6 +301,12 @@ def _json(status: int, body, headers) -> JSONResponse:
 def _oauth_error(exc: OAuth2Error) -> Response:
     status, body, headers = exc()
     return _json(status, body, headers)
+
+
+@app.exception_handler(OAuth2Error)
+async def _oauth_error_handler(_: Request, exc: OAuth2Error) -> Response:
+    """An OAuth error raised while building the request (insecure_transport over plain http) is a clean 400 with the OAuth body, not a 500."""
+    return _oauth_error(exc)
 
 
 @app.get("/oauth/authorize")
@@ -335,6 +347,8 @@ async def token(request: Request):
             if not vault.is_unlocked():                         # row MACs cannot be checked (clients, codes, tokens), so nothing is issued
                 raise RuntimeError("the vault is locked")
             status, body, headers = server.create_token_response(request=oreq)
+        except OAuth2Error as exc:                              # e.g. insecure_transport over plain http: a clean OAuth error, not a 500
+            return _oauth_error(exc)
         except (RuntimeError, vault_mod.VaultError) as exc:      # no signing key available (the vault is locked)
             return JSONResponse({"error": "temporarily_unavailable", "error_description": "tokens cannot be signed right now: " + str(exc)[:120]},
                                 status_code=503, headers={"Retry-After": "30", "Cache-Control": "no-store"})
